@@ -1,0 +1,24 @@
+{
+  "name": "flow-energy-saas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Advanced Energy Management & Analytics SaaS Platform",
+  "scripts": {
+    "dev": "pnpm --filter @flow-energy/web dev",
+    "build": "pnpm --filter @flow-energy/web build",
+    "lint": "pnpm -r run lint",
+    "type-check": "pnpm -r run type-check",
+    "clean": "pnpm -r run clean"
+  },
+  "keywords": [
+    "energy",
+    "saas",
+    "analytics",
+    "dashboard"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "rimraf": "^6.1.3"
+  }
+}
