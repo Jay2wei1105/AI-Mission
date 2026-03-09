@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRD_FEATURE_ENGINEER_V1.3</title>
+
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    font-size: 16px;
+    line-height: 1.5;
+    word-wrap: break-word;
+    color: #24292e;
+    background-color: #fff;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem;
+}
+h1, h2, h3, h4, h5, h6 {
+    margin-top: 24px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+}
+h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+code {
+    padding: 0.2em 0.4em;
+    margin: 0;
+    font-size: 85%;
+    background-color: #f6f8fa;
+    border-radius: 6px;
+    font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre {
+    padding: 16px;
+    overflow: auto;
+    font-size: 85%;
+    line-height: 1.45;
+    background-color: #f6f8fa;
+    border-radius: 6px;
+}
+pre code {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    overflow: visible;
+    line-height: inherit;
+    word-wrap: normal;
+    background-color: initial;
+    border: 0;
+}
+blockquote {
+    padding: 0 1em;
+    color: #6a737d;
+    border-left: 0.25em solid #dfe2e5;
+    margin: 0;
+}
+table {
+    display: block;
+    width: 100%;
+    margin-top: 0;
+    margin-bottom: 16px;
+    overflow: auto;
+    border-spacing: 0;
+    border-collapse: collapse;
+}
+table th, table td {
+    padding: 6px 13px;
+    border: 1px solid #dfe2e5;
+}
+table tr {
+    background-color: #fff;
+    border-top: 1px solid #c6cbd1;
+}
+table tr:nth-child(2n) {
+    background-color: #f6f8fa;
+}
+a { color: #0366d6; text-decoration: none; }
+a:hover { text-decoration: underline; }
+hr {
+    height: 0.25em;
+    padding: 0;
+    margin: 24px 0;
+    background-color: #e1e4e8;
+    border: 0;
+}
+</style>
+
+</head>
+<body>
+<h1 id="prd-v13-feature-engineering-implementation-guide">PRD v1.3: 特徵工程強健性實作指南 (Feature Engineering Implementation Guide)</h1>
+<h1 id="feature-annotation-v12metadata-group-policy">整合 Feature Annotation v1.2：Metadata 消費與 Group Policy 重構</h1>
+<p><strong>文件版本:</strong> v1.3-FA (Feature Annotation Consumption &amp; Device Role Awareness)<br />
+<strong>日期:</strong> 2026-02-13<br />
+<strong>負責人:</strong> Oscar Chang<br />
+<strong>目標模組:</strong> <code>src/etl/feature_engineer.py</code> (v1.3+)<br />
+<strong>上游契約:</strong> <code>src/etl/batch_processor.py</code> (v1.3-FA+, 檢查點 #3)<br />
+<strong>下游契約:</strong> <code>src/modeling/training_pipeline.py</code> (v1.0+, 輸出檢查點)<br />
+<strong>關鍵相依:</strong> <code>src/features/annotation_manager.py</code> (v1.2+, 提供 device_role 與 ignore_warnings 查詢)<br />
+<strong>預估工時:</strong> 5 ~ 6 個工程天（含 Annotation 整合與 Group Policy 重構）</p>
+<hr />
+<h2 id="1">1. 執行總綱與設計哲學</h2>
+<h3 id="11-v12-v13-fa">1.1 版本變更總覽 (v1.2 → v1.3-FA)</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">變更類別</th>
+<th style="text-align: left;">v1.2 狀態</th>
+<th style="text-align: left;">v1.3-FA 修正</th>
+<th style="text-align: center;">影響層級</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Metadata 來源</strong></td>
+<td style="text-align: left;">依賴 <code>get_feature_meta()</code> (重新探測)</td>
+<td style="text-align: left;"><strong>從 Manifest 接收</strong> <code>feature_metadata</code> (物理屬性) + <strong>直接查詢</strong> Annotation (device_role)</td>
+<td style="text-align: center;">🔴 Critical</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>device_role 消費</strong></td>
+<td style="text-align: left;">無</td>
+<td style="text-align: left;"><strong>直接讀取</strong> FeatureAnnotationManager (Cleaner 不傳遞，職責分離)</td>
+<td style="text-align: center;">🔴 Critical</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Group Policy 更新</strong></td>
+<td style="text-align: left;">使用推斷的 physical_type</td>
+<td style="text-align: left;"><strong>使用 Annotation SSOT</strong> 的 physical_type 與 device_role</td>
+<td style="text-align: center;">🔴 Critical</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>ignore_warnings</strong></td>
+<td style="text-align: left;">無</td>
+<td style="text-align: left;"><strong>查詢 Annotation</strong> 決定是否抑制特定警告 (W403)</td>
+<td style="text-align: center;">🟡 Medium</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Flags 硬編碼</strong></td>
+<td style="text-align: left;">Step 3.2 硬編碼 flags</td>
+<td style="text-align: left;"><strong>強制引用</strong> <code>VALID_QUALITY_FLAGS</code> (SSOT)</td>
+<td style="text-align: center;">🔴 Critical</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>稽核軌跡</strong></td>
+<td style="text-align: left;">無版本記錄</td>
+<td style="text-align: left;"><strong>驗證</strong> <code>annotation_audit_trail</code> (schema_version, inheritance_chain)</td>
+<td style="text-align: center;">🟡 Medium</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Data Leakage</strong></td>
+<td style="text-align: left;"><code>shift(1)</code> 防護</td>
+<td style="text-align: left;"><strong>保留</strong> <code>shift(1)</code> + <code>cutoff_timestamp</code> 嚴格檢查</td>
+<td style="text-align: center;">🔴 Critical</td>
+</tr>
+</tbody>
+</table>
+<h3 id="12">1.2 核心設計原則</h3>
+<ol>
+<li><strong>SSOT 嚴格遵守</strong>: 所有 quality flags 操作引用 <code>VALID_QUALITY_FLAGS</code>；所有 physical_type 與 device_role 決策引用 FeatureAnnotationManager</li>
+<li><strong>Metadata 分層消費</strong>:<br />
+   - <strong>物理屬性</strong> (physical_type, unit)：從 BatchProcessor Manifest 的 <code>feature_metadata</code> 讀取<br />
+   - <strong>設備角色</strong> (device_role, ignore_warnings)：直接查詢 FeatureAnnotationManager (YAML SSOT)</li>
+<li><strong>職責分離尊重</strong>: 不期待 Cleaner/BatchProcessor 傳遞 device_role，主動從 Annotation 層查詢</li>
+<li><strong>Group Policy 語意感知</strong>: 根據 device_role (primary/backup/seasonal) 調整統計特徵生成策略（如備用設備使用不同窗口）</li>
+<li><strong>繼承鏈相容</strong>: 正確處理 <code>inheritance_chain</code>，支援 base → site 的設定覆蓋</li>
+</ol>
+<hr />
+<h2 id="2-interface-contracts">2. 介面契約規範 (Interface Contracts)</h2>
+<h3 id="21-input-contract-from-batchprocessor-v13-fa">2.1 輸入契約 (Input Contract from BatchProcessor v1.3-FA)</h3>
+<p><strong>檢查點 #3: BatchProcessor → Feature Engineer</strong></p>
+<pre><code class="language-python"># 標準讀取範例 (必須實作)
+def load_from_batch_processor(manifest_path: Path) -&gt; Tuple[pl.LazyFrame, Dict, Dict]:
+    &quot;&quot;&quot;
+    Returns:
+        df: LazyFrame (Parquet 資料，INT64/UTC 驗證通過，不含 device_role)
+        feature_metadata: Dict (column_name -&gt; physical_type/unit，不含 device_role)
+        annotation_audit_trail: Dict (schema_version, inheritance_chain, yaml_checksum)
+    &quot;&quot;&quot;
+    manifest = Manifest.parse_file(manifest_path)
+
+    # 1. 驗證 Manifest 完整性 (E301)
+    if not manifest.validate_checksum():
+        raise ContractViolationError(&quot;E301: Manifest 損毀&quot;)
+
+    # 2. 【新增】驗證 Annotation 稽核軌跡 (E400)
+    audit = manifest.annotation_audit_trail
+    if audit:
+        expected_ver = FEATURE_ANNOTATION_CONSTANTS['expected_schema_version']
+        if audit.get('schema_version') != expected_ver:
+            raise ConfigurationError(
+                f&quot;E400: Manifest 的 Annotation 版本過舊 &quot;
+                f&quot;({audit.get('schema_version')} vs {expected_ver})&quot;
+            )
+
+    # 3. 讀取資料與 Metadata
+    files = [manifest_path.parent / f for f in manifest.output_files]
+    df = pl.scan_parquet(files)
+
+    return (
+        df, 
+        manifest.feature_metadata,  # 僅含物理屬性
+        audit  # 稽核資訊
+    )
+</code></pre>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">檢查項</th>
+<th style="text-align: left;">規範</th>
+<th style="text-align: center;">錯誤代碼</th>
+<th style="text-align: left;">處理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Manifest 完整性</td>
+<td style="text-align: left;"><code>checksum</code> 驗證通過</td>
+<td style="text-align: center;">E301</td>
+<td style="text-align: left;">拒絕讀取</td>
+</tr>
+<tr>
+<td style="text-align: left;">Annotation 版本</td>
+<td style="text-align: left;"><code>schema_version</code> 符合 SSOT</td>
+<td style="text-align: center;">E400</td>
+<td style="text-align: left;">終止流程</td>
+</tr>
+<tr>
+<td style="text-align: left;">timestamp 格式</td>
+<td style="text-align: left;"><code>INT64</code>, <code>nanoseconds</code>, <code>UTC</code></td>
+<td style="text-align: center;">E302</td>
+<td style="text-align: left;">拒絕讀取</td>
+</tr>
+<tr>
+<td style="text-align: left;">quality_flags 值</td>
+<td style="text-align: left;">⊆ <code>VALID_QUALITY_FLAGS</code></td>
+<td style="text-align: center;">E303</td>
+<td style="text-align: left;">拒絕讀取</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>device_role 欄位</strong></td>
+<td style="text-align: left;"><strong>禁止存在於 DataFrame</strong></td>
+<td style="text-align: center;">E500</td>
+<td style="text-align: left;">終止流程</td>
+</tr>
+<tr>
+<td style="text-align: left;">feature_metadata</td>
+<td style="text-align: left;">非空 (建議)</td>
+<td style="text-align: center;">E304 (Warning)</td>
+<td style="text-align: left;">使用保守預設</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-annotation">2.2 Annotation 直接查詢契約</h3>
+<p><strong>Feature Engineer 直接實例化 FeatureAnnotationManager</strong>:</p>
+<pre><code class="language-python"># 在 FeatureEngineer.__init__ 或 transform 中
+self.annotation_manager = FeatureAnnotationManager(
+    site_id=site_id,
+    yaml_base_dir=config.feature_annotation.yaml_base_dir
+)
+
+# 查詢 device_role (因 Cleaner 未傳遞)
+device_role = self.annotation_manager.get_column_config(col).device_role
+
+# 查詢是否抑制警告
+should_ignore = self.annotation_manager.should_ignore_warning(col, &quot;W403&quot;)
+</code></pre>
+<h3 id="23-output-contract-to-model-training">2.3 輸出契約 (Output Contract to Model Training)</h3>
+<p><strong>填補 GAP #5: Feature Engineer → Model Training</strong></p>
+<pre><code class="language-python">class FeatureEngineerOutputContract:
+    &quot;&quot;&quot;Feature Engineer v1.3-FA 輸出規範&quot;&quot;&quot;
+
+    # 1. 特徵矩陣 (Parquet 格式)
+    feature_matrix: pl.DataFrame
+
+    # 2. 目標變數資訊
+    target_variable: Optional[str]
+    target_metadata: Optional[FeatureMetadata]
+
+    # 3. Quality Flag 特徵 (SSOT 同步)
+    quality_flag_features: List[str]
+
+    # 4. 【新增】Annotation 稽核資訊 (供 Training Pipeline 記錄)
+    annotation_context: Dict = {
+        &quot;schema_version&quot;: &quot;1.2&quot;,
+        &quot;inheritance_chain&quot;: &quot;base -&gt; cgmh_ty&quot;,
+        &quot;yaml_checksum&quot;: &quot;sha256:...&quot;,
+        &quot;group_policies_applied&quot;: [&quot;chillers&quot;, &quot;towers&quot;]
+    }
+
+    # 5. 防 Data Leakage 資訊
+    train_test_split_info: Dict = {
+        &quot;temporal_cutoff&quot;: datetime,
+        &quot;strict_past_only&quot;: True,
+        &quot;excluded_future_rows&quot;: int
+    }
+
+    # 6. 特徵元資料 (供 Model 解釋性使用)
+    feature_metadata: Dict[str, FeatureMetadata]
+
+    # 7. 版本追蹤
+    feature_engineer_version: str = &quot;1.3-FA&quot;
+    upstream_manifest_id: str
+</code></pre>
+<hr />
+<h2 id="3-phase-based-implementation">3. 分階段實作計畫 (Phase-Based Implementation)</h2>
+<h3 id="phase-0-annotation-manager-day-1">Phase 0: Annotation Manager 整合基礎建設 (Day 1, 新增)</h3>
+<h4 id="step-01-ssot-manager">Step 0.1: SSOT 嚴格引用與 Manager 注入</h4>
+<p><strong>檔案</strong>: <code>src/etl/feature_engineer.py</code> (頂部)</p>
+<p><strong>實作內容</strong>:</p>
+<pre><code class="language-python">from typing import Dict, List, Optional, Union, Final, Tuple
+from datetime import datetime
+from pathlib import Path
+import polars as pl
+import numpy as np
+from pydantic import BaseModel
+
+# 【關鍵】SSOT 嚴格引用
+from src.etl.config_models import (
+    VALID_QUALITY_FLAGS,      # SSOT: 6個標準品質標記
+    TIMESTAMP_CONFIG,         # SSOT: UTC, ns
+    FeatureMetadata,          # SSOT: 欄位元資料 (物理屬性)
+    FeatureEngineeringConfig,
+    FEATURE_ANNOTATION_CONSTANTS
+)
+
+# 【新增】直接查詢 Annotation SSOT
+from src.features.annotation_manager import FeatureAnnotationManager, ColumnAnnotation
+
+# 錯誤代碼 (Interface Contract v1.0)
+ERROR_CODES: Final[Dict[str, str]] = {
+    &quot;E301&quot;: &quot;MANIFEST_INTEGRITY_FAILED&quot;,
+    &quot;E302&quot;: &quot;SCHEMA_MISMATCH&quot;,
+    &quot;E303&quot;: &quot;UNKNOWN_QUALITY_FLAG&quot;,
+    &quot;E304&quot;: &quot;METADATA_MISSING&quot;,
+    &quot;E305&quot;: &quot;DATA_LEAKAGE_DETECTED&quot;,
+    &quot;E400&quot;: &quot;ANNOTATION_VERSION_MISMATCH&quot;,  # 【新增】
+    &quot;E402&quot;: &quot;ANNOTATION_NOT_FOUND&quot;,         # 【新增】
+    &quot;E500&quot;: &quot;DEVICE_ROLE_LEAKAGE&quot;           # 【新增】
+}
+</code></pre>
+<h4 id="step-02-annotationmanager">Step 0.2: 建構子與 AnnotationManager 初始化</h4>
+<p><strong>檔案</strong>: <code>src/etl/feature_engineer.py</code> (<code>FeatureEngineer.__init__</code>)</p>
+<pre><code class="language-python">class FeatureEngineer:
+    &quot;&quot;&quot;
+    Feature Engineer v1.3-FA - 整合 Feature Annotation 消費
+
+    核心職責：
+    1. 從 Manifest 讀取物理屬性 (physical_type, unit)
+    2. 【新增】直接查詢 Annotation SSOT 取得 device_role 與 ignore_warnings
+    3. 應用語意感知的 Group Policy (根據 device_role 調整策略)
+    4. 確保不產生 Data Leakage
+    &quot;&quot;&quot;
+
+    def __init__(
+        self, 
+        config: FeatureEngineeringConfig,
+        site_id: str,
+        yaml_base_dir: str = &quot;config/features/sites&quot;  # 【新增】Annotation 路徑
+    ):
+        self.config = config
+        self.site_id = site_id
+        self.logger = get_logger(&quot;FeatureEngineer&quot;)
+
+        # 【關鍵】直接初始化 AnnotationManager (職責分離：不依赖 Cleaner 傳遞)
+        self.annotation_manager = FeatureAnnotationManager(
+            site_id=site_id,
+            yaml_base_dir=yaml_base_dir
+        )
+
+        self.logger.info(
+            f&quot;初始化 FeatureEngineer (Schema: {self.annotation_manager.schema_version}, &quot;
+            f&quot;繼承鏈: {self.annotation_manager.inheritance_chain})&quot;
+        )
+
+    def validate_annotation_compatibility(self, audit_trail: Dict):
+        &quot;&quot;&quot;
+        驗證 Annotation 版本相容性 (E400)
+        &quot;&quot;&quot;
+        if not audit_trail:
+            self.logger.warning(&quot;Manifest 缺少 annotation_audit_trail&quot;)
+            return
+
+        schema_ver = audit_trail.get('schema_version')
+        expected = FEATURE_ANNOTATION_CONSTANTS['expected_schema_version']
+
+        if schema_ver != expected:
+            raise ConfigurationError(
+                f&quot;E400: Annotation Schema 版本不符。期望: {expected}, 實際: {schema_ver}&quot;
+            )
+
+        # 驗證繼承鏈一致性 (可選，用於除錯)
+        manifest_chain = audit_trail.get('inheritance_chain', '')
+        manager_chain = self.annotation_manager.inheritance_chain
+        if manifest_chain != manager_chain:
+            self.logger.warning(
+                f&quot;繼承鏈不一致: Manifest={manifest_chain}, Manager={manager_chain}&quot;
+            )
+</code></pre>
+<hr />
+<h3 id="phase-1-manifest-day-1-2">Phase 1: 輸入驗證與 Manifest 讀取 (Day 1-2)</h3>
+<h4 id="step-11">Step 1.1: 讀取與驗證（更新版）</h4>
+<p><strong>方法</strong>: <code>load_from_manifest(manifest_path: Path) -&gt; Tuple[...]</code></p>
+<p><strong>詳細邏輯</strong>:</p>
+<pre><code class="language-python">def load_from_manifest(
+    self, 
+    manifest_path: Path
+) -&gt; Tuple[pl.LazyFrame, Dict[str, FeatureMetadata], Dict]:
+    &quot;&quot;&quot;
+    從 BatchProcessor v1.3-FA Manifest 讀取資料與 Metadata
+
+    【關鍵】回傳 annotation_audit_trail 供後續驗證
+    &quot;&quot;&quot;
+    from src.etl.manifest import Manifest
+
+    manifest = Manifest.parse_file(manifest_path)
+
+    # 1. 驗證 Manifest 完整性 (E301)
+    if not manifest.validate_checksum():
+        raise ContractViolationError(f&quot;E301: Manifest 完整性驗證失敗: {manifest_path}&quot;)
+
+    # 2. 驗證 Annotation 稽核軌跡 (E400)
+    audit_trail = getattr(manifest, 'annotation_audit_trail', {})
+    if audit_trail:
+        self.validate_annotation_compatibility(audit_trail)
+    else:
+        self.logger.warning(&quot;Manifest 缺少 annotation_audit_trail，跳過版本檢查&quot;)
+
+    # 3. 驗證 SSOT 版本相容性 (quality_flags)
+    if set(manifest.quality_flags_schema) != set(VALID_QUALITY_FLAGS):
+        self.logger.warning(
+            f&quot;Manifest flags 版本與 SSOT 不同: &quot;
+            f&quot;Manifest={manifest.quality_flags_schema}, SSOT={VALID_QUALITY_FLAGS}&quot;
+        )
+
+    # 4. 驗證 timestamp Schema (E302)
+    ts_schema = manifest.timestamp_schema
+    if ts_schema.get(&quot;format&quot;) != &quot;INT64&quot; or ts_schema.get(&quot;timezone&quot;) != &quot;UTC&quot;:
+        raise ContractViolationError(f&quot;E302: Timestamp schema 不符: {ts_schema}&quot;)
+
+    # 5. 讀取 Parquet
+    files = [manifest_path.parent / f for f in manifest.output_files]
+    if not files:
+        raise DataValidationError(f&quot;Manifest 未包含輸出檔案: {manifest_path}&quot;)
+
+    df = pl.scan_parquet(files)
+
+    # 6. 【關鍵】驗證 DataFrame 不含 device_role (E500)
+    if &quot;device_role&quot; in df.columns:
+        raise ContractViolationError(
+            f&quot;E500: DataFrame 包含禁止欄位 'device_role'。 &quot;
+            f&quot;Cleaner 不應傳遞 device_role，Feature Engineer 應直接查詢 Annotation。&quot;
+        )
+
+    # 7. 檢查 feature_metadata (E304)
+    metadata = manifest.feature_metadata
+    if not metadata:
+        if self.config.input_contract.enforce_manifest_metadata:
+            raise ContractViolationError(&quot;E304: Manifest 缺少 feature_metadata&quot;)
+        else:
+            self.logger.warning(&quot;E304: 使用保守預設&quot;)
+            metadata = self._infer_metadata_conservative(df)
+
+    return df, metadata, audit_trail
+</code></pre>
+<hr />
+<h3 id="phase-2-ssot-flags-day-2">Phase 2: SSOT 合規的 Flags 處理 (Day 2)</h3>
+<h4 id="step-21-quality-flags-ssot">Step 2.1: Quality Flags 處理（SSOT 引用）</h4>
+<p><strong>方法</strong>: <code>_handle_quality_flags(df: pl.DataFrame) -&gt; pl.DataFrame</code></p>
+<p><strong>詳細邏輯</strong>:</p>
+<pre><code class="language-python">def _handle_quality_flags(self, df: pl.DataFrame) -&gt; pl.DataFrame:
+    &quot;&quot;&quot;
+    處理 Quality Flags (SSOT 合規版本)
+
+    【關鍵】引用 VALID_QUALITY_FLAGS，無硬編碼
+    &quot;&quot;&quot;
+    strategy = self.config.input_contract.quality_flags_handling
+
+    if strategy == &quot;drop&quot;:
+        has_flags = pl.col(&quot;quality_flags&quot;).list.len() &gt; 0
+        return df.filter(~has_flags)
+
+    elif strategy == &quot;onehot&quot;:
+        # 【SSOT 引用】動態獲取所有合法 flags
+        all_flags = VALID_QUALITY_FLAGS  # ✅ 正確: 引用 SSOT
+
+        generated_flags = []
+        for flag in all_flags:
+            col_name = f&quot;is_{flag.lower()}_flag&quot;
+            df = df.with_columns(
+                pl.col(&quot;quality_flags&quot;)
+                .list.contains(flag)
+                .alias(col_name)
+            )
+            generated_flags.append(col_name)
+
+        self.quality_flag_features = generated_flags
+        return df
+
+    return df
+</code></pre>
+<hr />
+<h3 id="phase-3-group-policy-day-3-4">Phase 3: 語意感知 Group Policy (Day 3-4, 核心更新)</h3>
+<h4 id="step-31-group-policy-annotation-ssot">Step 3.1: Group Policy 解析（使用 Annotation SSOT）</h4>
+<p><strong>方法</strong>: <code>_resolve_group_policies(metadata: Dict) -&gt; Dict[str, StatsRule]</code></p>
+<p><strong>詳細邏輯</strong>:</p>
+<pre><code class="language-python">def _resolve_group_policies(
+    self, 
+    manifest_metadata: Dict[str, FeatureMetadata]
+) -&gt; Dict[str, StatsRule]:
+    &quot;&quot;&quot;
+    解析 Group Policies，使用 Annotation SSOT (physical_type + device_role)
+
+    【關鍵修正】v1.2 僅使用 physical_type；v1.3-FA 增加 device_role 感知
+    &quot;&quot;&quot;
+    resolved = {}
+
+    for policy in self.config.stats_features.group_policies:
+        target_cols = []
+
+        for col, meta in manifest_metadata.items():
+            # 1. 匹配 physical_type (來自 Manifest)
+            if meta.physical_type not in policy.apply_to_types:
+                continue
+
+            # 2. 【新增】查詢 device_role (來自 AnnotationManager)
+            col_config = self.annotation_manager.get_column_config(col)
+            if not col_config:
+                self.logger.warning(f&quot;欄位 {col} 在 Annotation 中未定義，跳過 Group Policy&quot;)
+                continue
+
+            device_role = col_config.device_role
+
+            # 3. 【新增】根據 device_role 調整策略
+            if device_role == &quot;backup&quot; and policy.name == &quot;High_Freq&quot;:
+                # 備用設備不使用高頻採樣策略（可能長期停機）
+                self.logger.debug(f&quot;欄位 {col} (backup) 跳過 High_Freq 策略&quot;)
+                continue
+
+            if device_role == &quot;seasonal&quot; and policy.name == &quot;Strict_Balance&quot;:
+                # 季節性設備放寬平衡檢查
+                self.logger.debug(f&quot;欄位 {col} (seasonal) 放寬 Strict_Balance&quot;)
+
+            # 4. 排除目標變數 (Data Leakage 防護)
+            if meta.is_target:
+                continue
+
+            target_cols.append(col)
+
+        # 5. 應用規則 (含繼承處理)
+        for col in target_cols:
+            if (self.config.stats_features.column_overrides and 
+                col in self.config.stats_features.column_overrides):
+                resolved[col] = self.config.stats_features.column_overrides[col]
+            else:
+                # 【新增】根據 device_role 調整窗口大小
+                col_config = self.annotation_manager.get_column_config(col)
+                base_rule = policy.rules
+
+                if col_config and col_config.device_role == &quot;backup&quot;:
+                    # 備用設備使用較大窗口（平滑長期停機影響）
+                    adjusted_rule = self._adjust_rule_for_backup(base_rule)
+                    resolved[col] = adjusted_rule
+                else:
+                    resolved[col] = base_rule
+
+    return resolved
+
+def _adjust_rule_for_backup(self, base_rule: StatsRule) -&gt; StatsRule:
+    &quot;&quot;&quot;
+    為備用設備調整統計規則 (設備角色感知)
+    &quot;&quot;&quot;
+    # 備用設備：增大 rolling window，減少 lag 數量
+    adjusted = base_rule.copy()
+
+    if adjusted.rolling_windows:
+        # 窗口增大 2 倍（但不超过 96）
+        adjusted.rolling_windows = [
+            min(w * 2, 96) for w in adjusted.rolling_windows
+        ]
+
+    if adjusted.lag_intervals:
+        # 只保留前 2 個 lag
+        adjusted.lag_intervals = adjusted.lag_intervals[:2]
+
+    return adjusted
+</code></pre>
+<h4 id="step-32-data-leakage">Step 3.2: 統計特徵生成（Data Leakage 防護 + 警告抑制）</h4>
+<p><strong>方法</strong>: <code>_generate_stats_features(df: pl.DataFrame, column_rules: Dict) -&gt; pl.DataFrame</code></p>
+<p><strong>詳細邏輯</strong>:</p>
+<pre><code class="language-python">def _generate_stats_features(
+    self, 
+    df: pl.DataFrame, 
+    column_rules: Dict[str, StatsRule]
+) -&gt; pl.DataFrame:
+    &quot;&quot;&quot;
+    生成統計特徵，支援 device_role 感知與 ignore_warnings
+    &quot;&quot;&quot;
+    expressions = []
+
+    for col, rules in column_rules.items():
+        if col not in df.columns:
+            continue
+
+        # 【新增】查詢 ignore_warnings (來自 Annotation)
+        col_config = self.annotation_manager.get_column_config(col)
+        ignore_warnings = col_config.ignore_warnings if col_config else []
+
+        # Lag 特徵 (Data Leakage 防護：shift)
+        for lag in rules.lag_intervals:
+            if lag &gt; len(df) * 0.5:
+                # 【新增】檢查是否應忽略 W402 (窗口過大警告)
+                if &quot;W402&quot; not in ignore_warnings:
+                    self.logger.warning(f&quot;W402: 欄位 {col} lag {lag} 超過資料長度 50%&quot;)
+                continue
+
+            expressions.append(
+                pl.col(col).shift(lag).alias(f&quot;{col}_lag_{lag}&quot;)
+            )
+
+        # Rolling 特徵 (嚴格 shift(1) 防護)
+        for window in rules.rolling_windows:
+            if window &gt; len(df) * 0.5:
+                if &quot;W402&quot; not in ignore_warnings:
+                    self.logger.warning(f&quot;W402: 欄位 {col} window {window} 超過 50%&quot;)
+                continue
+
+            # 這裡省略具體 rolling 計算，與原邏輯相同
+            # ...
+
+    return df.with_columns(expressions) if expressions else df
+</code></pre>
+<hr />
+<h3 id="phase-4-model-training-day-4-5">Phase 4: 輸出準備與 Model Training 銜接 (Day 4-5)</h3>
+<h4 id="step-41">Step 4.1: 輸出契約建構（更新版）</h4>
+<p><strong>方法</strong>: <code>_build_output_contract(...) -&gt; FeatureEngineerOutputContract</code></p>
+<pre><code class="language-python">def _build_output_contract(
+    self, 
+    df: pl.DataFrame, 
+    manifest: Manifest,
+    audit_trail: Dict,
+    target_col: Optional[str] = None
+) -&gt; FeatureEngineerOutputContract:
+    &quot;&quot;&quot;
+    建構輸出契約，包含 Annotation 上下文
+    &quot;&quot;&quot;
+    # 目標變數處理
+    target_metadata = None
+    if target_col and target_col in manifest.feature_metadata:
+        target_metadata = manifest.feature_metadata[target_col]
+
+    # 特徵元資料 (標記 derived)
+    feature_metadata = {}
+    for col in df.columns:
+        if col in [&quot;timestamp&quot;, target_col]:
+            continue
+
+        if col in manifest.feature_metadata:
+            feature_metadata[col] = manifest.feature_metadata[col]
+        else:
+            feature_metadata[col] = FeatureMetadata(
+                column_name=col,
+                physical_type=&quot;derived&quot;,
+                is_target=False
+            )
+
+    # 【新增】Annotation 上下文 (供 Training Pipeline 記錄)
+    annotation_context = {
+        &quot;schema_version&quot;: audit_trail.get('schema_version', 'unknown'),
+        &quot;inheritance_chain&quot;: audit_trail.get('inheritance_chain', 'none'),
+        &quot;yaml_checksum&quot;: audit_trail.get('yaml_checksum', ''),
+        &quot;group_policies_applied&quot;: [
+            p.name for p in self.config.stats_features.group_policies
+        ],
+        &quot;device_role_aware&quot;: True  # 標記已應用設備角色感知
+    }
+
+    return FeatureEngineerOutputContract(
+        feature_matrix=df,
+        target_variable=target_col,
+        target_metadata=target_metadata,
+        quality_flag_features=getattr(self, 'quality_flag_features', []),
+        annotation_context=annotation_context,  # 【新增】
+        train_test_split_info={
+            &quot;temporal_cutoff&quot;: self.config.cutoff_timestamp.isoformat() if self.config.cutoff_timestamp else None,
+            &quot;strict_past_only&quot;: True
+        },
+        feature_metadata=feature_metadata,
+        upstream_manifest_id=manifest.batch_id,
+        feature_engineer_version=&quot;1.3-FA&quot;
+    )
+</code></pre>
+<hr />
+<h2 id="4-error-codes">4. 錯誤代碼對照表 (Error Codes)</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">錯誤代碼</th>
+<th style="text-align: left;">名稱</th>
+<th style="text-align: center;">發生階段</th>
+<th style="text-align: left;">說明</th>
+<th style="text-align: left;">處理建議</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>E301</strong></td>
+<td style="text-align: left;"><code>MANIFEST_INTEGRITY_FAILED</code></td>
+<td style="text-align: center;">Step 1.1</td>
+<td style="text-align: left;">Manifest checksum 驗證失敗</td>
+<td style="text-align: left;">重新執行 BatchProcessor</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E302</strong></td>
+<td style="text-align: left;"><code>SCHEMA_MISMATCH</code></td>
+<td style="text-align: center;">Step 1.1</td>
+<td style="text-align: left;">Parquet Schema 非 INT64/UTC</td>
+<td style="text-align: left;">重新執行 BatchProcessor</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E303</strong></td>
+<td style="text-align: left;"><code>UNKNOWN_QUALITY_FLAG</code></td>
+<td style="text-align: center;">Step 2.1</td>
+<td style="text-align: left;">輸入含未定義 flags</td>
+<td style="text-align: left;">確認 SSOT 版本一致性</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E304</strong></td>
+<td style="text-align: left;"><code>METADATA_MISSING</code></td>
+<td style="text-align: center;">Step 1.1</td>
+<td style="text-align: left;">Manifest 無 feature_metadata</td>
+<td style="text-align: left;">升級 BatchProcessor</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E305</strong></td>
+<td style="text-align: left;"><code>DATA_LEAKAGE_DETECTED</code></td>
+<td style="text-align: center;">Step 3.2</td>
+<td style="text-align: left;">包含未來資料</td>
+<td style="text-align: left;">檢查 cutoff_timestamp</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E400</strong></td>
+<td style="text-align: left;"><code>ANNOTATION_VERSION_MISMATCH</code></td>
+<td style="text-align: center;">Step 0.2/1.1</td>
+<td style="text-align: left;">Manifest 的 Annotation 版本過舊</td>
+<td style="text-align: left;">執行 migrate-excel</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E402</strong></td>
+<td style="text-align: left;"><code>ANNOTATION_NOT_FOUND</code></td>
+<td style="text-align: center;">Step 3.1</td>
+<td style="text-align: left;">欄位未定義於 Annotation</td>
+<td style="text-align: left;">執行 features wizard</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>E500</strong></td>
+<td style="text-align: left;"><code>DEVICE_ROLE_LEAKAGE</code></td>
+<td style="text-align: center;">Step 1.1</td>
+<td style="text-align: left;">DataFrame 含 device_role 欄位</td>
+<td style="text-align: left;">檢查 Cleaner 職責分離</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5-test-plan">5. 測試與驗證計畫 (Test Plan)</h2>
+<h3 id="51-unit-tests">5.1 單元測試 (Unit Tests)</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">測試案例 ID</th>
+<th style="text-align: left;">描述</th>
+<th style="text-align: left;">輸入</th>
+<th style="text-align: left;">預期結果</th>
+<th style="text-align: center;">對應 Step</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>FE13-FA-01</strong></td>
+<td style="text-align: left;">E400 版本檢查</td>
+<td style="text-align: left;">Manifest schema_version=1.1</td>
+<td style="text-align: left;">拋出 E400</td>
+<td style="text-align: center;">0.2</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>FE13-FA-02</strong></td>
+<td style="text-align: left;">device_role 查詢</td>
+<td style="text-align: left;">呼叫 annotation_manager</td>
+<td style="text-align: left;">正確取得 primary/backup/seasonal</td>
+<td style="text-align: center;">3.1</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>FE13-FA-03</strong></td>
+<td style="text-align: left;">Group Policy 設備感知</td>
+<td style="text-align: left;">backup 設備套用 High_Freq</td>
+<td style="text-align: left;">策略被跳過</td>
+<td style="text-align: center;">3.1</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>FE13-FA-04</strong></td>
+<td style="text-align: left;">ignore_warnings 生效</td>
+<td style="text-align: left;">標記 W403 忽略</td>
+<td style="text-align: left;">不觸發高零值警告</td>
+<td style="text-align: center;">3.2</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>FE13-FA-05</strong></td>
+<td style="text-align: left;">繼承鏈驗證</td>
+<td style="text-align: left;">cgmh_ty 繼承 base</td>
+<td style="text-align: left;">正確解析繼承的 physical_types</td>
+<td style="text-align: center;">3.1</td>
+</tr>
+<tr>
+<td style="text-align: left;">FE13-001</td>
+<td style="text-align: left;">SSOT Flags 引用</td>
+<td style="text-align: left;">VALID_QUALITY_FLAGS 更新</td>
+<td style="text-align: left;">One-hot 自動包含新 flag</td>
+<td style="text-align: center;">2.1</td>
+</tr>
+<tr>
+<td style="text-align: left;">FE13-002</td>
+<td style="text-align: left;">Metadata 接收</td>
+<td style="text-align: left;">Manifest 含 physical_type</td>
+<td style="text-align: left;">Group Policy 正確套用</td>
+<td style="text-align: center;">3.1</td>
+</tr>
+</tbody>
+</table>
+<h3 id="52-integration-tests">5.2 整合測試 (Integration Tests)</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">測試案例 ID</th>
+<th style="text-align: left;">描述</th>
+<th style="text-align: center;">上游</th>
+<th style="text-align: center;">下游</th>
+<th style="text-align: left;">驗證目標</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>INT-FE-FA-01</strong></td>
+<td style="text-align: left;">完整 Metadata 消費</td>
+<td style="text-align: center;">BP v1.3-FA (audit_trail) + Annotation YAML</td>
+<td style="text-align: center;">FE v1.3-FA</td>
+<td style="text-align: left;">正確讀取 device_role，應用語意策略</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>INT-FE-FA-02</strong></td>
+<td style="text-align: left;">Backup 設備特徵</td>
+<td style="text-align: center;">Backup 設備資料</td>
+<td style="text-align: center;">FE v1.3-FA</td>
+<td style="text-align: left;">使用放大窗口，不觸發 W403</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>INT-FE-FA-03</strong></td>
+<td style="text-align: left;">繼承鏈一致性</td>
+<td style="text-align: center;">base.yaml + site.yaml</td>
+<td style="text-align: center;">FE v1.3-FA</td>
+<td style="text-align: left;">正確合併 Group Policies</td>
+</tr>
+<tr>
+<td style="text-align: left;">INT-F01</td>
+<td style="text-align: left;">BP v1.3 → FE v1.3</td>
+<td style="text-align: center;">BP v1.3</td>
+<td style="text-align: center;">FE v1.3-FA</td>
+<td style="text-align: left;">正確接收 metadata</td>
+</tr>
+<tr>
+<td style="text-align: left;">INT-F02</td>
+<td style="text-align: left;">FE → Model Training</td>
+<td style="text-align: center;">FE v1.3-FA</td>
+<td style="text-align: center;">Training Pipeline</td>
+<td style="text-align: left;">傳遞 annotation_context</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6-risk-assessment">6. 風險評估與緩解 (Risk Assessment)</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">風險</th>
+<th style="text-align: center;">嚴重度</th>
+<th style="text-align: center;">可能性</th>
+<th style="text-align: left;">緩解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Annotation 版本漂移</strong> (E400)</td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: center;">Medium</td>
+<td style="text-align: left;">啟動時嚴格檢查 schema_version</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>device_role 查詢失敗</strong></td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: center;">Low</td>
+<td style="text-align: left;">欄位未定義時拋出 E402，不允許預設值</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>SSOT 不同步</strong> (flags)</td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: center;">Medium</td>
+<td style="text-align: left;">比對 manifest.quality_flags_schema 與 VALID_QUALITY_FLAGS</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Data Leakage</strong> (shift 錯誤)</td>
+<td style="text-align: center;">🔴 Critical</td>
+<td style="text-align: center;">Low</td>
+<td style="text-align: left;">單元測試驗證 T 時刻特徵不包含 T 時刻值</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>繼承鏈複雜度</strong></td>
+<td style="text-align: center;">🟡 Medium</td>
+<td style="text-align: center;">Medium</td>
+<td style="text-align: left;">記錄 inheritance_chain 供除錯，驗證合併結果</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7-version-compatibility">7. 版本相容性矩陣 (Version Compatibility)</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;">BatchProcessor</th>
+<th style="text-align: center;">Feature Engineer</th>
+<th style="text-align: center;">Feature Annotation</th>
+<th style="text-align: center;">相容性</th>
+<th style="text-align: left;">說明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;">v1.3-FA (audit_trail)</td>
+<td style="text-align: center;"><strong>v1.3-FA</strong></td>
+<td style="text-align: center;">v1.2</td>
+<td style="text-align: center;">✅ <strong>完全相容</strong></td>
+<td style="text-align: left;">推薦配置，支援 device_role 感知</td>
+</tr>
+<tr>
+<td style="text-align: center;">v1.3-FA</td>
+<td style="text-align: center;"><strong>v1.3-FA</strong></td>
+<td style="text-align: center;">v1.1</td>
+<td style="text-align: center;">⚠️ <strong>降級相容</strong></td>
+<td style="text-align: left;">缺少 device_role，使用預設 primary</td>
+</tr>
+<tr>
+<td style="text-align: center;">v1.3</td>
+<td style="text-align: center;"><strong>v1.3-FA</strong></td>
+<td style="text-align: center;">v1.2</td>
+<td style="text-align: center;">⚠️ <strong>部分相容</strong></td>
+<td style="text-align: left;">缺少 audit_trail，跳過版本檢查</td>
+</tr>
+<tr>
+<td style="text-align: center;">v1.2</td>
+<td style="text-align: center;"><strong>v1.3-FA</strong></td>
+<td style="text-align: center;">任意</td>
+<td style="text-align: center;">❌ <strong>不相容</strong></td>
+<td style="text-align: left;">無法讀取 feature_metadata，拋出 E304</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="8-deliverables">8. 交付物清單 (Deliverables)</h2>
+<h3 id="81">8.1 程式碼檔案</h3>
+<ol>
+<li><code>src/etl/feature_engineer.py</code> - 主要實作 (v1.3-FA，含 AnnotationManager 整合)</li>
+<li><code>src/etl/config_models.py</code> - 更新 FeatureEngineeringConfig (支援 device_role 感知)</li>
+<li><code>src/etl/manifest.py</code> - 更新 Manifest 模型 (接收 annotation_audit_trail)</li>
+</ol>
+<h3 id="82">8.2 測試檔案</h3>
+<ol start="4">
+<li><code>tests/test_feature_engineer_v13_fa.py</code> - v1.3-FA 專屬測試 (device_role 感知)</li>
+<li><code>tests/test_group_policy_device_role.py</code> - Group Policy 設備角色測試</li>
+<li><code>tests/test_annotation_integration_fe.py</code> - 與 AnnotationManager 整合測試</li>
+</ol>
+<h3 id="83">8.3 文件檔案</h3>
+<ol start="7">
+<li><code>docs/feature_engineering/PRD_FEATURE_ENGINEER_v1.3-FA.md</code> - 本文件</li>
+<li><code>docs/feature_engineering/DEVICE_ROLE_GUIDE.md</code> - device_role 與 Group Policy 使用說明</li>
+</ol>
+<hr />
+<h2 id="9-sign-off-checklist">9. 驗收簽核 (Sign-off Checklist)</h2>
+<ul>
+<li>[ ] <strong>SSOT 引用</strong>: 無硬編碼 flags，全部引用 <code>VALID_QUALITY_FLAGS</code></li>
+<li>[ ] <strong>Metadata 分層消費</strong>: </li>
+<li>[ ] physical_type/unit 從 Manifest 讀取</li>
+<li>[ ] device_role/ignore_warnings 從 AnnotationManager 查詢</li>
+<li>[ ] <strong>職責分離尊重</strong>: 不期待輸入 DataFrame 包含 device_role，直接查詢 YAML SSOT</li>
+<li>[ ] <strong>Group Policy 語意感知</strong>: </li>
+<li>[ ] backup 設備正確跳過 High_Freq 策略</li>
+<li>[ ] seasonal 設備正確放寬 Strict_Balance</li>
+<li>[ ] <strong>警告抑制</strong>: 標記 ignore_warnings 的欄位正確抑制 W402/W403</li>
+<li>[ ] <strong>版本檢查</strong>: Manifest 的 schema_version 不符時正確拋出 E400</li>
+<li>[ ] <strong>繼承鏈處理</strong>: 正確消費繼承自 base.yaml 的 Group Policies</li>
+<li>[ ] <strong>Data Leakage</strong>: <code>shift(1)</code> 正確實作，驗證通過</li>
+<li>[ ] <strong>輸出契約</strong>: 正確產生 <code>annotation_context</code> 供 Training Pipeline 記錄</li>
+<li>[ ] <strong>下游銜接</strong>: Model Training 可正確讀取輸出，包含設備角色資訊</li>
+</ul>
+<hr />
+<p><strong>關鍵設計確認</strong>：<br />
+1. Feature Engineer <strong>主動查詢</strong> device_role (因 Cleaner 不傳遞)<br />
+2. Group Policy 同時使用 <strong>physical_type</strong> (Manifest) 與 <strong>device_role</strong> (Annotation)<br />
+3. <strong>ignore_warnings</strong> 直接查詢 Annotation，不經由 Manifest 傳遞<br />
+4. <strong>繼承鏈</strong> 透過 AnnotationManager 處理，與 Manifest 的 audit_trail 交叉驗證</p>
+</body>
+</html>

@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRD_BATCH_PROCESSOR_v1.1</title>
+
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    font-size: 16px;
+    line-height: 1.5;
+    word-wrap: break-word;
+    color: #24292e;
+    background-color: #fff;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem;
+}
+h1, h2, h3, h4, h5, h6 {
+    margin-top: 24px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+}
+h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+code {
+    padding: 0.2em 0.4em;
+    margin: 0;
+    font-size: 85%;
+    background-color: #f6f8fa;
+    border-radius: 6px;
+    font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre {
+    padding: 16px;
+    overflow: auto;
+    font-size: 85%;
+    line-height: 1.45;
+    background-color: #f6f8fa;
+    border-radius: 6px;
+}
+pre code {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    overflow: visible;
+    line-height: inherit;
+    word-wrap: normal;
+    background-color: initial;
+    border: 0;
+}
+blockquote {
+    padding: 0 1em;
+    color: #6a737d;
+    border-left: 0.25em solid #dfe2e5;
+    margin: 0;
+}
+table {
+    display: block;
+    width: 100%;
+    margin-top: 0;
+    margin-bottom: 16px;
+    overflow: auto;
+    border-spacing: 0;
+    border-collapse: collapse;
+}
+table th, table td {
+    padding: 6px 13px;
+    border: 1px solid #dfe2e5;
+}
+table tr {
+    background-color: #fff;
+    border-top: 1px solid #c6cbd1;
+}
+table tr:nth-child(2n) {
+    background-color: #f6f8fa;
+}
+a { color: #0366d6; text-decoration: none; }
+a:hover { text-decoration: underline; }
+hr {
+    height: 0.25em;
+    padding: 0;
+    margin: 24px 0;
+    background-color: #e1e4e8;
+    border: 0;
+}
+</style>
+
+</head>
+<body>
+<h1 id="prd-v11-batchprocessor-implementation-guide">PRD v1.1: 批次處理器強健性重構指南 (BatchProcessor Implementation Guide)</h1>
+<p><strong>文件版本:</strong> v1.1 (含 Manifest 機制與 Schema 契約驗證)<br />
+<strong>日期:</strong> 2026-02-12<br />
+<strong>負責人:</strong> Oscar Chang<br />
+<strong>目標模組:</strong> <code>src/etl/batch_processor_v2.py</code><br />
+<strong>相依模組:</strong> <code>src/etl/cleaner_v2.py</code> (v2.1+), <code>src/etl/feature_engineer.py</code> (v1.2+)<br />
+<strong>預估工時:</strong> 4 ~ 5 個工程天（含整合測試）</p>
+<hr />
+<h2 id="1">1. 執行總綱與設計哲學</h2>
+<p>目前的 <code>batch_processor.py</code> 存在<strong>記憶體堆積</strong>與<strong>契約破壞</strong>的致命傷。本 PRD 定義 <strong>V2.0 Pipeline 架構</strong>，將其從「資料囤積者」轉型為「高效指揮官」，並作為 Cleaner 與 Feature Engineer 間的<strong>契約守門員</strong>。</p>
+<p><strong>核心設計原則:</strong><br />
+1.  <strong>串流優先 (Streaming First)</strong>：嚴禁將多檔案 DataFrame 同時載入記憶體。處理完一個，立即釋放。<br />
+2.  <strong>時間分區聚合 (Time-Partitioned)</strong>：避免一對一 CSV 轉 Parquet 導致小文件爆炸，改用列數/時間閾值合併寫入。<br />
+3.  <strong>契約守護 (Contract Guardian)</strong>：驗證 Cleaner 輸出是否符合 <code>Output Contract</code>，攔截型別錯誤（如 <code>quality_flags</code> 被誤轉為 Float64）。<br />
+4.  <strong>事務性輸出 (Transactional Output)</strong>：Staging + Atomic Move，批次失敗時自動回滾，不污染下游。<br />
+5.  <strong>可追溯性 (Traceability)</strong>：透過 <strong>Manifest（清單）機制</strong>記錄批次血緣，供 Feature Engineer 精準讀取。</p>
+<hr />
+<h2 id="2-pipeline-manifest">2. 系統架構：Pipeline 模式（含 Manifest）</h2>
+<h3 id="21">2.1 資料流與關鍵變更</h3>
+<pre><code class="language-mermaid">graph TD
+    A[Source CSVs] --&gt;|Iterate| B(Parser)
+    B --&gt;|Raw DF| C[Cleaner v2.1]
+    C --&gt;|Clean DF| D{Schema Validator&lt;br/&gt;檢查 quality_flags 等}
+    D --&gt;|Pass| E[Buffer Accumulator&lt;br/&gt;時間分區緩衝]
+    D --&gt;|Fail| F[Error Log&lt;br/&gt;記錄失敗檔案]
+    E --&gt;|達閾值| G[Staging Writer&lt;br/&gt;.staging/{batch_id}]
+    G --&gt;|批次完成| H{Atomic Move&lt;br/&gt;原子性移動}
+    H --&gt;|成功| I[Final Dataset&lt;br/&gt;processed/{site}/year=2026/...]
+    H --&gt;|成功| J[manifest.json&lt;br/&gt;清單與統計]
+    H --&gt;|失敗| K[Rollback&lt;br/&gt;清理 Staging]
+    I --&gt;|讀取| L[Feature Engineer&lt;br/&gt;透過 manifest 而非 glob]
+</code></pre>
+<h3 id="22-vs-legacy">2.2 關鍵變更對照（vs Legacy）</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">功能模組</th>
+<th style="text-align: left;">舊版實作 (Legacy)</th>
+<th style="text-align: left;">新版實作 (Pipeline v1.1)</th>
+<th style="text-align: left;">風險/優勢</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>記憶體管理</strong></td>
+<td style="text-align: left;"><code>List[DataFrame]</code> 累積</td>
+<td style="text-align: left;"><strong>Process-and-Dump</strong> + 緩衝區</td>
+<td style="text-align: left;">OOM 風險歸零</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>輸出檔案策略</strong></td>
+<td style="text-align: left;">一對一 CSV→Parquet</td>
+<td style="text-align: left;"><strong>時間分區合併</strong>（100MB/閾值）</td>
+<td style="text-align: left;">避免小文件爆炸（50萬檔案問題）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>型別處理</strong></td>
+<td style="text-align: left;">強制全轉 Float64</td>
+<td style="text-align: left;"><strong>Schema 契約驗證</strong>（保留 List[str]）</td>
+<td style="text-align: left;">不會抹除 <code>quality_flags</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>輸出事務性</strong></td>
+<td style="text-align: left;">直接寫入正式目錄</td>
+<td style="text-align: left;"><strong>Staging + Atomic Move</strong></td>
+<td style="text-align: left;">失敗時無髒資料，支援冪等重跑</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>下游銜接</strong></td>
+<td style="text-align: left;">Feature Engineer glob 搜尋</td>
+<td style="text-align: left;"><strong>Manifest 清單機制</strong></td>
+<td style="text-align: left;">精準讀取、支援血緣追蹤、去重</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>時間連續性</strong></td>
+<td style="text-align: left;">無保證</td>
+<td style="text-align: left;"><strong>強制排序 + 跨檔去重</strong></td>
+<td style="text-align: left;">Feature Engineer Lag 計算正確</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-interface-contracts">3. 輸入輸出契約（Interface Contracts）</h2>
+<h3 id="31-from-cleaner-v21">3.1 上游輸入（From Cleaner v2.1）</h3>
+<p>BatchProcessor <strong>嚴格驗證</strong> Cleaner 輸出，確保符合 Feature Engineer 預期：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">欄位</th>
+<th style="text-align: left;">預期型別</th>
+<th style="text-align: left;">驗證邏輯</th>
+<th style="text-align: left;">失敗處理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>timestamp</code></td>
+<td style="text-align: left;"><code>pl.Datetime(time_zone="UTC")</code></td>
+<td style="text-align: left;">必須存在、無重複、嚴格遞增</td>
+<td style="text-align: left;">拋出 <code>ContractViolationError</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>quality_flags</code></td>
+<td style="text-align: left;"><code>pl.List(pl.Utf8)</code></td>
+<td style="text-align: left;">不可為 Null、不可被轉為 Float64</td>
+<td style="text-align: left;">拋出 <code>TypeError</code>，記錄錯誤檔案</td>
+</tr>
+<tr>
+<td style="text-align: left;">資料欄位</td>
+<td style="text-align: left;"><code>pl.Float64</code>（SI 制單位）</td>
+<td style="text-align: left;">無極端異常值（如 1e20）</td>
+<td style="text-align: left;">標記警告但繼續處理</td>
+</tr>
+<tr>
+<td style="text-align: left;">時間連續性</td>
+<td style="text-align: left;">間隔恆定</td>
+<td style="text-align: left;">檢查與 <code>resample_interval</code> 一致</td>
+<td style="text-align: left;">記錄 <code>INSUFFICIENT_DATA</code> 標記</td>
+</tr>
+</tbody>
+</table>
+<h3 id="32-to-feature-engineer">3.2 下游輸出（To Feature Engineer）</h3>
+<p>BatchProcessor 輸出<strong>保證</strong>以下規格：</p>
+<pre><code class="language-yaml">輸出目錄結構:
+data/processed/
+├── {site_id}/
+│   ├── year=2026/
+│   │   ├── month=02/
+│   │   │   ├── part-0001.parquet  (100MB ~ 1GB)
+│   │   │   └── part-0002.parquet
+│   │   └── month=03/
+│   │       └── ...
+└── manifests/
+    └── manifest-{batch_id}-{timestamp}.json
+</code></pre>
+<p><strong>Parquet Schema 規範</strong>：<br />
+- <code>timestamp</code>: <code>INT64 (nanoseconds)</code> + UTC 時區資訊（或 <code>INT96</code>）<br />
+- <code>quality_flags</code>: Parquet Logical Type <code>LIST&lt;STRING&gt;</code>，對應 Polars <code>List[Utf8]</code><br />
+- 其他欄位: <code>FLOAT64</code></p>
+<p><strong>Manifest 檔案格式</strong>：</p>
+<pre><code class="language-json">{
+  &quot;manifest_version&quot;: &quot;1.0&quot;,
+  &quot;batch_id&quot;: &quot;550e8400-e29b-41d4-a716-446655440000&quot;,
+  &quot;site_id&quot;: &quot;CGMH-TY&quot;,
+  &quot;created_at&quot;: &quot;2026-02-12T14:30:00Z&quot;,
+  &quot;input_files_count&quot;: 150,
+  &quot;output_files&quot;: [
+    &quot;year=2026/month=02/part-0001.parquet&quot;,
+    &quot;year=2026/month=02/part-0002.parquet&quot;
+  ],
+  &quot;statistics&quot;: {
+    &quot;total_rows&quot;: 1500000,
+    &quot;time_range&quot;: [&quot;2026-02-01T00:00:00Z&quot;, &quot;2026-02-28T23:55:00Z&quot;],
+    &quot;quality_flags_distribution&quot;: {
+      &quot;FROZEN&quot;: 150,
+      &quot;HEAT_IMBALANCE&quot;: 2300,
+      &quot;INSUFFICIENT_DATA&quot;: 45
+    }
+  },
+  &quot;schema_hash&quot;: &quot;sha256:a1b2c3d4...&quot;,  // 用於快取失效檢測
+  &quot;checksum&quot;: &quot;sha256:e5f6g7h8...&quot;      // 完整性驗證
+}
+</code></pre>
+<hr />
+<h2 id="4">4. 分階段實作計畫</h2>
+<h3 id="phase-1-1">Phase 1: 基礎架構與配置 (預估 1 天)</h3>
+<h4 id="step-11-etlconfig">Step 1.1: 統一配置模型（ETLConfig）</h4>
+<p><strong>檔案</strong>: <code>src/etl/config_models.py</code></p>
+<pre><code class="language-python">from pydantic import BaseModel, validator, root_validator
+from typing import Literal, Optional
+import psutil
+
+class BatchConfig(BaseModel):
+    input_pattern: str = &quot;*.csv&quot;
+    output_base_dir: str = &quot;data/processed/&quot;
+    staging_dir: str = &quot;data/.staging/&quot;  # 暫存區（事務性）
+
+    # 【關鍵】輸出控制（避免小文件爆炸）
+    max_rows_per_file: int = 100_000      # 單一 Parquet 檔案最大列數
+    max_time_span_per_file: str = &quot;1d&quot;    # 單一檔案最大時間跨度
+    output_format: Literal[&quot;parquet&quot;] = &quot;parquet&quot;
+    compression: str = &quot;snappy&quot;
+
+    # 記憶體防護
+    memory_limit_mb: int = 4096
+    memory_action: Literal[&quot;warn&quot;, &quot;throttle&quot;, &quot;stop&quot;] = &quot;throttle&quot;
+
+    # 錯誤處理
+    stop_on_error: bool = False
+    max_retry_per_file: int = 3
+
+    # 【關鍵】Manifest 機制
+    manifest_enabled: bool = True
+    manifest_dir: str = &quot;data/manifests/&quot;
+
+class ETLConfig(BaseModel):
+    &quot;&quot;&quot;統一配置，確保 Cleaner 與 BatchProcessor 相容&quot;&quot;&quot;
+    cleaner: CleaningConfig      # 見 Cleaner PRD v2.1
+    batch: BatchConfig
+
+    @root_validator
+    def check_compatibility(cls, values):
+        &quot;&quot;&quot;驗證 Batch 輸出與 Cleaner 設定相容&quot;&quot;&quot;
+        cleaner = values.get('cleaner')
+        batch = values.get('batch')
+        # 確保時間解析度一致（避免 Cleaner 輸出 5m 但 Batch 以為是 1h）
+        if hasattr(batch, 'time_resolution') and batch.time_resolution != cleaner.resample_interval:
+            raise ValueError(f&quot;Batch time_resolution ({batch.time_resolution}) &quot;
+                           f&quot;must match Cleaner resample_interval ({cleaner.resample_interval})&quot;)
+        return values
+</code></pre>
+<h4 id="step-12-orchestrator">Step 1.2: 建立 Orchestrator 骨架（含記憶體監控）</h4>
+<p><strong>檔案</strong>: <code>src/etl/batch_processor_v2.py</code></p>
+<pre><code class="language-python">import psutil
+import time
+from pathlib import Path
+from typing import List, Set, Dict
+import polars as pl
+from uuid import uuid4
+
+class BatchOrchestrator:
+    def __init__(self, config: ETLConfig):
+        self.config = config
+        self.parser = ReportParser()
+        self.cleaner = DataCleaner(config.cleaner)
+        self.batch_config = config.batch
+
+        # 緩衝區（累積小檔案，達閾值後寫入）
+        self.buffer: List[pl.DataFrame] = []
+        self.buffer_rows = 0
+        self.current_batch_id = str(uuid4())
+
+        # 時間追蹤（用於檔案命名與去重）
+        self.seen_timestamps: Set[str] = set()  # 可選：跨檔去重
+
+        # 統計
+        self.stats = {
+            &quot;processed_files&quot;: 0,
+            &quot;failed_files&quot;: [],
+            &quot;total_rows&quot;: 0,
+            &quot;quality_flags_dist&quot;: {}
+        }
+
+    def _check_memory(self):
+        &quot;&quot;&quot;記憶體監控與防護&quot;&quot;&quot;
+        mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        if mem_mb &gt; self.batch_config.memory_limit_mb:
+            if self.batch_config.memory_action == &quot;stop&quot;:
+                raise MemoryError(f&quot;Memory limit exceeded: {mem_mb:.0f}MB&quot;)
+            elif self.batch_config.memory_action == &quot;throttle&quot;:
+                self.logger.warning(f&quot;High memory usage: {mem_mb:.0f}MB, throttling...&quot;)
+                time.sleep(1)
+</code></pre>
+<h3 id="phase-2-schema-2">Phase 2: 核心管線實作（Schema 驗證與事務性）(預估 2 天)</h3>
+<h4 id="step-21-schema">Step 2.1: Schema 契約驗證器</h4>
+<p><strong>檔案</strong>: <code>src/etl/contract_validator.py</code></p>
+<pre><code class="language-python">class OutputContractValidator:
+    &quot;&quot;&quot;驗證 Cleaner 輸出符合 Feature Engineer 預期&quot;&quot;&quot;
+
+    REQUIRED_COLUMNS = [&quot;timestamp&quot;, &quot;quality_flags&quot;]
+    ALLOWED_FLAG_TYPES = [&quot;FROZEN&quot;, &quot;HEAT_IMBALANCE&quot;, &quot;AFFINITY_VIOLATION&quot;, 
+                          &quot;OUTLIER&quot;, &quot;INSUFFICIENT_DATA&quot;]
+
+    @classmethod
+    def validate(cls, df: pl.DataFrame) -&gt; None:
+        # 1. 檢查必要欄位
+        missing = set(cls.REQUIRED_COLUMNS) - set(df.columns)
+        if missing:
+            raise ContractViolationError(f&quot;Missing required columns: {missing}&quot;)
+
+        # 2. 【關鍵】驗證 quality_flags 型別（防止被轉為 Float64）
+        qf_dtype = df[&quot;quality_flags&quot;].dtype
+        if qf_dtype != pl.List(pl.Utf8):
+            raise TypeError(
+                f&quot;Column 'quality_flags' must be List[str] (Polars: List[Utf8]), &quot;
+                f&quot;got {qf_dtype}. This usually means accidental casting to numeric.&quot;
+            )
+
+        # 3. 驗證時間戳
+        if df[&quot;timestamp&quot;].dtype != pl.Datetime:
+            raise TypeError(f&quot;timestamp must be Datetime, got {df['timestamp'].dtype}&quot;)
+
+        # 4. 驗證無極端未來資料（防 Data Leakage）
+        if df[&quot;timestamp&quot;].max() &gt; datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError(&quot;Data contains future timestamps &gt; 5 minutes from now&quot;)
+</code></pre>
+<h4 id="step-22">Step 2.2: 單檔處理原子函數（含緩衝累積）</h4>
+<pre><code class="language-python">def process_single_file(self, file_path: Path) -&gt; BatchResult:
+    &quot;&quot;&quot;
+    處理單一檔案，寫入緩衝區，達閾值時觸發寫入 Staging
+    &quot;&quot;&quot;
+    try:
+        # 1. 解析
+        raw_df = self.parser.parse_file(str(file_path))
+
+        # 2. 清洗
+        clean_df = self.cleaner.clean(raw_df)
+
+        # 3. 【關鍵】Schema 契約驗證（攔截型別錯誤）
+        OutputContractValidator.validate(clean_df)
+
+        # 4. 時間排序與去重（確保 Feature Engineer Lag 計算正確）
+        clean_df = clean_df.sort(&quot;timestamp&quot;)
+        if self.batch_config.deduplicate_timestamps:
+            clean_df = clean_df.unique(subset=[&quot;timestamp&quot;], keep=&quot;first&quot;)
+
+        # 5. 累積到緩衝區（控制輸出檔案大小）
+        self._accumulate_to_buffer(clean_df, file_path.stem)
+
+        self.stats[&quot;processed_files&quot;] += 1
+        return BatchResult(status=&quot;success&quot;, rows=len(clean_df))
+
+    except ContractViolationError as e:
+        self.logger.error(f&quot;Contract violation in {file_path}: {e}&quot;)
+        self.stats[&quot;failed_files&quot;].append({&quot;file&quot;: str(file_path), &quot;error&quot;: str(e)})
+        return BatchResult(status=&quot;contract_failed&quot;, error=str(e))
+    except Exception as e:
+        self.logger.error(f&quot;Processing failed {file_path}: {e}&quot;)
+        if self.batch_config.stop_on_error:
+            raise
+        self.stats[&quot;failed_files&quot;].append({&quot;file&quot;: str(file_path), &quot;error&quot;: str(e)})
+        return BatchResult(status=&quot;failed&quot;, error=str(e))
+
+def _accumulate_to_buffer(self, df: pl.DataFrame, source_name: str):
+    &quot;&quot;&quot;
+    累積資料到緩衝區，達到列數或時間閾值時寫入 Staging
+    &quot;&quot;&quot;
+    self.buffer.append(df)
+    self.buffer_rows += len(df)
+
+    # 檢查是否達寫入閾值
+    if self.buffer_rows &gt;= self.batch_config.max_rows_per_file:
+        self._flush_buffer_to_staging()
+
+    # 記憶體檢查
+    self._check_memory()
+</code></pre>
+<h4 id="step-23-staging-atomic-move">Step 2.3: Staging 寫入與事務性（Atomic Move）</h4>
+<pre><code class="language-python">def _flush_buffer_to_staging(self):
+    &quot;&quot;&quot;將緩衝區寫入 Staging 目錄&quot;&quot;&quot;
+    if not self.buffer:
+        return
+
+    # 合併緩衝區
+    combined = pl.concat(self.buffer)
+
+    # 時間分區路徑：year=2026/month=02/part-{uuid}.parquet
+    min_ts = combined[&quot;timestamp&quot;].min()
+    year, month = min_ts.year, min_ts.month
+    part_file = f&quot;part-{uuid4().hex[:8]}.parquet&quot;
+
+    staging_path = Path(self.batch_config.staging_dir) / self.current_batch_id / f&quot;year={year}&quot; / f&quot;month={month:02d}&quot;
+    staging_path.mkdir(parents=True, exist_ok=True)
+
+    file_path = staging_path / part_file
+
+    # 寫入 Parquet（保留 List[str] 型別）
+    combined.write_parquet(
+        file_path,
+        compression=self.batch_config.compression,
+        use_pyarrow=True  # 確保 List 型別正確
+    )
+
+    self.logger.info(f&quot;Flushed {len(combined)} rows to {file_path}&quot;)
+
+    # 清空緩衝區
+    self.buffer = []
+    self.buffer_rows = 0
+
+def finalize_batch(self) -&gt; Manifest:
+    &quot;&quot;&quot;
+    批次完成：原子性移動 Staging → Final，產生 Manifest
+    &quot;&quot;&quot;
+    try:
+        # 1. 清空最後緩衝區
+        self._flush_buffer_to_staging()
+
+        # 2. 產生 Manifest
+        manifest = self._generate_manifest()
+
+        # 3. 【關鍵】原子性移動：Staging → Final
+        staging_base = Path(self.batch_config.staging_dir) / self.current_batch_id
+        final_base = Path(self.batch_config.output_base_dir)
+
+        if staging_base.exists():
+            # 移動所有檔案到正式目錄
+            for src_file in staging_base.rglob(&quot;*.parquet&quot;):
+                rel_path = src_file.relative_to(staging_base)
+                dst_file = final_base / rel_path
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                src_file.replace(dst_file)  # 原子性移動（同檔案系統內）
+
+            # 寫入 Manifest
+            manifest_path = Path(self.batch_config.manifest_dir) / f&quot;manifest-{self.current_batch_id}.json&quot;
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(manifest.json(), encoding='utf-8')
+
+            # 4. 清理 Staging
+            import shutil
+            shutil.rmtree(staging_base)
+
+            self.logger.info(f&quot;Batch {self.current_batch_id} committed successfully&quot;)
+            return manifest
+
+    except Exception as e:
+        self.logger.error(f&quot;Batch finalization failed: {e}&quot;)
+        self._rollback_staging()
+        raise
+
+def _rollback_staging(self):
+    &quot;&quot;&quot;失敗時回滾：清理 Staging 目錄&quot;&quot;&quot;
+    staging_path = Path(self.batch_config.staging_dir) / self.current_batch_id
+    if staging_path.exists():
+        import shutil
+        shutil.rmtree(staging_path)
+        self.logger.info(f&quot;Rolled back staging: {staging_path}&quot;)
+</code></pre>
+<h3 id="phase-3-manifest-15">Phase 3: Manifest 機制與下游銜接 (預估 1.5 天)</h3>
+<h4 id="step-31-manifest">Step 3.1: Manifest 模型與產生</h4>
+<pre><code class="language-python">from pydantic import BaseModel
+from datetime import datetime
+from typing import List, Dict
+
+class Manifest(BaseModel):
+    manifest_version: str = &quot;1.0&quot;
+    batch_id: str
+    site_id: str
+    created_at: datetime
+    input_files_count: int
+    output_files: List[str]
+    statistics: Dict
+    schema_hash: str
+    checksum: str
+
+    def save(self, path: Path):
+        path.write_text(self.json(indent=2), encoding='utf-8')
+
+def _generate_manifest(self) -&gt; Manifest:
+    &quot;&quot;&quot;產生批次清單&quot;&quot;&quot;
+    staging_base = Path(self.batch_config.staging_dir) / self.current_batch_id
+    output_files = [
+        str(f.relative_to(staging_base)) 
+        for f in staging_base.rglob(&quot;*.parquet&quot;)
+    ]
+
+    # 計算 Schema 雜湊（用於快取失效）
+    schema_str = str(sorted([(c, str(t)) for c, t in self.buffer[0].schema.items()])) if self.buffer else &quot;&quot;
+    schema_hash = hashlib.sha256(schema_str.encode()).hexdigest()[:16]
+
+    return Manifest(
+        batch_id=self.current_batch_id,
+        site_id=self.config.cleaner.site_id,  # 假設 CleanerConfig 有 site_id
+        created_at=datetime.now(timezone.utc),
+        input_files_count=self.stats[&quot;processed_files&quot;],
+        output_files=output_files,
+        statistics={
+            &quot;total_rows&quot;: self.stats[&quot;total_rows&quot;],
+            &quot;quality_flags_distribution&quot;: self.stats[&quot;quality_flags_dist&quot;]
+        },
+        schema_hash=schema_hash,
+        checksum=&quot;sha256:...&quot;  # 實際計算檔案雜湊
+    )
+</code></pre>
+<h4 id="step-32-feature-engineer">Step 3.2: 提供 Feature Engineer 讀取範例</h4>
+<p><strong>文件</strong>: <code>docs/batch_to_feature_engineer_interface.md</code></p>
+<pre><code class="language-python"># Feature Engineer 讀取範例（透過 Manifest）
+def load_from_manifest(manifest_path: Path) -&gt; pl.LazyFrame:
+    &quot;&quot;&quot;透過 Manifest 精準讀取，避免 glob 小文件爆炸&quot;&quot;&quot;
+    import json
+    manifest = json.loads(manifest_path.read_text())
+
+    base_dir = manifest_path.parent.parent / &quot;processed&quot;  # 調整路徑
+    files = [base_dir / f for f in manifest[&quot;output_files&quot;]]
+
+    # 使用 scan_parquet 惰性讀取（記憶體友好）
+    return pl.scan_parquet(files)
+
+# 驗證 Schema 一致性
+def validate_schema(df: pl.LazyFrame, expected_manifest: dict):
+    actual_schema = df.schema
+    # 驗證 quality_flags 為 List[str]
+    assert actual_schema[&quot;quality_flags&quot;] == pl.List(pl.Utf8), \
+        &quot;Schema mismatch: quality_flags must be List[str]&quot;
+</code></pre>
+<h3 id="phase-4-05">Phase 4: 驗證與監控 (預估 0.5 天)</h3>
+<h4 id="step-41">Step 4.1: 記憶體穩定性測試</h4>
+<pre><code class="language-python">def test_memory_stability():
+    &quot;&quot;&quot;驗證處理 1000 個檔案時記憶體持平&quot;&quot;&quot;
+    initial_mem = psutil.Process().memory_info().rss
+
+    for i in range(1000):
+        orchestrator.process_single_file(mock_file)
+        if i % 100 == 0:
+            current_mem = psutil.Process().memory_info().rss
+            assert current_mem &lt; initial_mem * 1.5, &quot;Memory leak detected&quot;
+</code></pre>
+<h4 id="step-42-quality_flags">Step 4.2: 契約驗證測試（防 quality_flags 被抹除）</h4>
+<pre><code class="language-python">def test_quality_flags_preserved():
+    &quot;&quot;&quot;驗證輸出 Parquet 保留 List[str] 型別&quot;&quot;&quot;
+    # 執行批次處理
+    orchestrator.run()
+
+    # 讀取輸出的 Parquet
+    output_file = list(Path(&quot;data/processed&quot;).rglob(&quot;*.parquet&quot;))[0]
+    df = pl.read_parquet(output_file)
+
+    # 關鍵驗證：quality_flags 必須是 List[str]，而非 Null 或 Float64
+    assert df[&quot;quality_flags&quot;].dtype == pl.List(pl.Utf8)
+    assert df[&quot;quality_flags&quot;].null_count() == 0  # 可為空列表，不可為 Null
+</code></pre>
+<hr />
+<h2 id="5">5. 風險評估與緩解（更新）</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">風險</th>
+<th style="text-align: center;">嚴重度</th>
+<th style="text-align: left;">緩解措施（v1.1 設計）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>小文件爆炸</strong></td>
+<td style="text-align: center;">🔴 Critical</td>
+<td style="text-align: left;"><strong>時間分區合併</strong>（<code>max_rows_per_file: 100000</code>），避免一對一 CSV→Parquet</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>quality_flags 被抹除</strong></td>
+<td style="text-align: center;">🔴 Critical</td>
+<td style="text-align: left;"><strong>Schema 契約驗證</strong>（<code>OutputContractValidator</code>），型別錯誤立即拋出</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>批次失敗殘留髒資料</strong></td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: left;"><strong>Staging + Atomic Move</strong> 事務機制，失敗自動 Rollback</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>記憶體 OOM</strong></td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: left;"><strong>Process-and-Dump</strong> + 記憶體監控（<code>memory_limit_mb</code>）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Feature Engineer 讀取錯誤</strong></td>
+<td style="text-align: center;">🟠 High</td>
+<td style="text-align: left;"><strong>Manifest 機制</strong>替代 glob，精準追蹤輸出檔案與 Schema 雜湊</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>時間順序錯亂</strong></td>
+<td style="text-align: center;">🟠 Medium</td>
+<td style="text-align: left;"><strong>強制排序</strong>（<code>sort("timestamp")</code>）+ 跨檔去重（選配）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>配置不一致</strong></td>
+<td style="text-align: center;">🟡 Medium</td>
+<td style="text-align: left;"><strong>ETLConfig 統一驗證</strong>，確保 Cleaner 與 Batch 時間解析度相容</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6">6. 交付產物清單</h2>
+<ol>
+<li><code>src/etl/batch_processor_v2.py</code>: 全新 Orchestrator（含 Staging、Manifest、記憶體監控）</li>
+<li><code>src/etl/contract_validator.py</code>: Schema 契約驗證器（防 quality_flags 型別錯誤）</li>
+<li><code>src/etl/config_models.py</code>: 更新 <code>BatchConfig</code>, <code>ETLConfig</code>（統一驗證）</li>
+<li><code>src/etl/manifest.py</code>: Manifest 資料模型與管理</li>
+<li><code>tests/test_batch_processor_v2.py</code>: <br />
+   - 記憶體穩定性測試（1000 檔案迴圈）<br />
+   - Schema 契約驗證測試（防 Float64 轉型）<br />
+   - 事務性測試（Staging → Atomic Move → Rollback）</li>
+<li><code>tests/integration/test_cleaner_to_batch.py</code>: Cleaner 輸出 → Batch 輸入整合測試</li>
+<li><code>docs/batch_to_feature_engineer_interface.md</code>: 給 Feature Engineer 團隊的讀取範例（含 Manifest 使用）</li>
+<li><code>scripts/run_batch_pipeline.py</code>: CLI 入口腳本（含 argparse）</li>
+</ol>
+<hr />
+<h2 id="7">7. 與上下游協作檢查清單</h2>
+<p>在部署前，請與相關負責人確認：</p>
+<h3 id="cleaner-v21">與 Cleaner v2.1 團隊：</h3>
+<ul>
+<li>[ ] <code>quality_flags</code> 輸出是否保證為 <code>List[str]</code>（Polars <code>List[Utf8]</code>）？</li>
+<li>[ ] 時間戳是否已排序？（BatchProcessor 會二次排序，但預排序可提升效能）</li>
+<li>[ ] <code>resample_interval</code> 設定值（用於驗證時間連續性）</li>
+</ul>
+<h3 id="feature-engineer">與 Feature Engineer 團隊：</h3>
+<ul>
+<li>[ ] 是否接受透過 <code>manifest.json</code> 讀取檔案清單（而非 <code>glob("*.parquet")</code>）？</li>
+<li>[ ] Parquet 時間戳格式偏好（<code>INT64 (nanoseconds)</code> vs <code>INT96</code>）？</li>
+<li>[ ] 單一 Parquet 檔案大小偏好（建議 100MB ~ 1GB）？</li>
+<li>[ ] 是否需要 <code>schema_hash</code> 用於特徵快取失效檢測？</li>
+</ul>
+<h3 id="_1">與維運團隊：</h3>
+<ul>
+<li>[ ] 檔案系統是否支援 Atomic Move（同分割區內 <code>mv</code> 為原子性）？</li>
+<li>[ ] Staging 目錄（<code>data/.staging/</code>）是否有足夠磁碟空間（預估為輸出資料的 2 倍）？</li>
+<li>[ ] 是否需要整合 Prometheus/Grafana 監控（輸出 <code>batch_rows_processed</code> 等指標）？</li>
+</ul>
+<hr />
+<p><strong>關鍵修改總結</strong>：<br />
+1. <strong>Schema 契約驗證</strong>：攔截 <code>quality_flags</code> 被誤轉為 Float64 的風險（Critical）<br />
+2. <strong>時間分區合併</strong>：避免 50 萬小文件問題（Critical）<br />
+3. <strong>Staging + Atomic Move</strong>：事務性輸出，支援冪等重跑（High）<br />
+4. <strong>Manifest 機制</strong>：替代 glob，提供血緣追蹤與精準讀取（High）<br />
+5. <strong>統一 ETLConfig</strong>：確保 Cleaner 與 BatchProcessor 配置相容（Medium）<br />
+```</p>
+</body>
+</html>

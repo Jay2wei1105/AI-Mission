@@ -1,24 +1,29 @@
 {
-  "name": "flow-energy-saas",
-  "version": "0.1.0",
+  "name": "saas-ems-platform",
+  "version": "1.0.0",
   "private": true,
-  "description": "Advanced Energy Management & Analytics SaaS Platform",
+  "description": "SaaS Energy Management System - Analytics & Optimization Platform",
   "scripts": {
-    "dev": "pnpm --filter @flow-energy/web dev",
-    "build": "pnpm --filter @flow-energy/web build",
-    "lint": "pnpm -r run lint",
-    "type-check": "pnpm -r run type-check",
-    "clean": "pnpm -r run clean"
+    "dev": "concurrently \"pnpm dev:frontend\" \"pnpm dev:backend\"",
+    "dev:frontend": "cd frontend && pnpm dev",
+    "dev:backend": "cd backend && uvicorn app.main:app --reload --port 8000",
+    "build:frontend": "cd frontend && pnpm build",
+    "lint:frontend": "cd frontend && pnpm lint",
+    "test:backend": "cd backend && python -m pytest tests/ -v",
+    "install:frontend": "cd frontend && pnpm install",
+    "install:backend": "cd backend && pip install -r requirements.txt"
   },
   "keywords": [
     "energy",
     "saas",
     "analytics",
+    "hvac",
+    "optimization",
     "dashboard"
   ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "rimraf": "^6.1.3"
+    "concurrently": "^9.1.0"
   }
 }

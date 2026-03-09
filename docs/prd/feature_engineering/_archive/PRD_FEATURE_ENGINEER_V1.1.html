@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRD_FEATURE_ENGINEER_V1.1</title>
+
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    font-size: 16px;
+    line-height: 1.5;
+    word-wrap: break-word;
+    color: #24292e;
+    background-color: #fff;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem;
+}
+h1, h2, h3, h4, h5, h6 {
+    margin-top: 24px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+}
+h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+code {
+    padding: 0.2em 0.4em;
+    margin: 0;
+    font-size: 85%;
+    background-color: #f6f8fa;
+    border-radius: 6px;
+    font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre {
+    padding: 16px;
+    overflow: auto;
+    font-size: 85%;
+    line-height: 1.45;
+    background-color: #f6f8fa;
+    border-radius: 6px;
+}
+pre code {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    overflow: visible;
+    line-height: inherit;
+    word-wrap: normal;
+    background-color: initial;
+    border: 0;
+}
+blockquote {
+    padding: 0 1em;
+    color: #6a737d;
+    border-left: 0.25em solid #dfe2e5;
+    margin: 0;
+}
+table {
+    display: block;
+    width: 100%;
+    margin-top: 0;
+    margin-bottom: 16px;
+    overflow: auto;
+    border-spacing: 0;
+    border-collapse: collapse;
+}
+table th, table td {
+    padding: 6px 13px;
+    border: 1px solid #dfe2e5;
+}
+table tr {
+    background-color: #fff;
+    border-top: 1px solid #c6cbd1;
+}
+table tr:nth-child(2n) {
+    background-color: #f6f8fa;
+}
+a { color: #0366d6; text-decoration: none; }
+a:hover { text-decoration: underline; }
+hr {
+    height: 0.25em;
+    padding: 0;
+    margin: 24px 0;
+    background-color: #e1e4e8;
+    border: 0;
+}
+</style>
+
+</head>
+<body>
+<h1 id="prd-v11-feature-engineering-implementation-guide">PRD v1.1: 特徵工程強健性實作指南 (Feature Engineering Implementation Guide)</h1>
+<p><strong>文件版本:</strong> v1.1<br />
+<strong>日期:</strong> 2026-02-12<br />
+<strong>負責人:</strong> Oscar Chang<br />
+<strong>目標模組:</strong> <code>src/etl/feature_engineer.py</code> (New Module)<br />
+<strong>相依模組:</strong> <code>src/etl/cleaner.py</code> (v2.0+), <code>src/utils/physics.py</code><br />
+<strong>預估工時:</strong> 3 ~ 4 個工程天（含整合測試）</p>
+<hr />
+<h2 id="1">1. 執行總綱與設計原則</h2>
+<h3 id="11">1.1 核心職責</h3>
+<p>本模組專注於 <strong>「加法與創造」</strong>，嚴格禁止執行資料清洗或過濾。所有輸入資料必須先經過 <code>DataCleaner</code> 處理。</p>
+<p><strong>設計原則：</strong><br />
+1. <strong>防禦式設計</strong>：即使 Cleaner 輸出異常（含 Null、空缺），仍不拋出致命錯誤<br />
+2. <strong>冪等性 (Idempotency)</strong>：相同輸入執行多次，輸出必須完全一致<br />
+3. <strong>記憶體安全</strong>：禁止產生維度爆炸特徵，強制限制 Rolling Window 大小</p>
+<h3 id="12-inputoutput-contract">1.2 輸入輸出契約（Input/Output Contract）</h3>
+<pre><code class="language-python">class FeatureEngineerInputContract:
+    &quot;&quot;&quot;
+    Feature Engineer 對輸入資料的嚴格要求
+    由 DataCleaner 保證，或由本模組在 transform() 開頭驗證
+    &quot;&quot;&quot;
+    required_columns: List[str] = [&quot;timestamp&quot;]  # 必須包含時間戳欄位
+    expected_frequency: str = &quot;15min&quot;            # 資料頻率，用於驗證時間連續性
+    timestamp_tz: str = &quot;UTC&quot;                    # 強制 UTC，禁止時區轉換
+
+    # 與 Cleaner 的銜接策略
+    quality_flags_handling: Literal[&quot;drop&quot;, &quot;onehot&quot;, &quot;ignore&quot;] = &quot;onehot&quot;
+    # drop: 刪除有標記的列（保守，損失資料）
+    # onehot: 將標記拆解為特徵（推薦，保留資訊）
+    # ignore: 忽略標記（快速，但可能引入雜訊）
+
+class FeatureEngineerOutputContract:
+    &quot;&quot;&quot;
+    輸出資料規格保證
+    &quot;&quot;&quot;
+    feature_naming_convention: str = &quot;{original_col}_{transformation}_{parameters}&quot;
+    # 例：chiller_load_rollmean_96 (15分鐘資料，96點=24小時)
+    null_strategy: str = &quot;propagate_with_flag&quot;   # Null 傳播但標記，不隱藏
+</code></pre>
+<h3 id="13-in-scope-vs-out-of-scope">1.3 功能範圍 (In-Scope vs Out-of-Scope)</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">範圍</th>
+<th style="text-align: left;">包含項目 (In-Scope)</th>
+<th style="text-align: left;">排除項目 (Out-of-Scope)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>P1 物理特徵</strong></td>
+<td style="text-align: left;">濕球溫度 (Wet Bulb)、焓值 (Enthalpy)<br>（從 Cleaner 遷移至此）</td>
+<td style="text-align: left;">單位轉換（由 Cleaner 處理後輸入 SI 制）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>P1 時間特徵</strong></td>
+<td style="text-align: left;">小時、星期、平假日<br>週期性編碼 (sin/cos)</td>
+<td style="text-align: left;">節假日判斷（需外部日曆 API，超出範圍）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>P2 統計特徵</strong></td>
+<td style="text-align: left;">Lag 特徵 (延遲)<br>Rolling 統計（平均、標準差、最大/最小）</td>
+<td style="text-align: left;">複雜統計（如指數加權移動平均 EWM，P3 考慮）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>P3 互動特徵</strong></td>
+<td style="text-align: left;"><strong>Out-of-Scope for v1.1</strong><br>（保留配置介面但標記為未實作）</td>
+<td style="text-align: left;">非線性交互項（如 <code>Load^2</code>、<code>Load × Temp</code>）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="2">2. 系統架構與配置</h2>
+<h3 id="21-cleaner-prd">2.1 與 Cleaner PRD 的整合配置</h3>
+<p>統一配置檔結構（與 Cleaner PRD 共用 <code>etl_pipeline</code> 區塊）：</p>
+<pre><code class="language-yaml"># config/settings.yaml
+etl_pipeline:
+  cleaner:
+    schema_version: &quot;2.0&quot;
+    # ... Cleaner 設定（見 Cleaner PRD）
+
+  feature_engineer:
+    schema_version: &quot;1.1&quot;
+
+    # 輸入契約驗證
+    input_contract:
+      quality_flags_handling: &quot;onehot&quot;  # drop | onehot | ignore
+      null_handling: &quot;propagate&quot;        # propagate | fail_fast
+
+    # 物理特徵
+    physics_features:
+      enabled: true
+      library: &quot;psychrolib&quot;             # 或自研 ASHRAE 公式
+      input_validation:
+        temp_range: [-40, 60]           # °C，超出範圍回傳 Null
+        rh_range: [0, 100]              # %，超出範圍回傳 Null
+        pressure_default: 1013.25       # hPa，若輸入缺漏使用預設值
+
+    # 時間特徵
+    time_features:
+      enabled: true
+      cyclical_encoding: true           # 產生 sin/cos
+      components: [&quot;hour&quot;, &quot;day_of_week&quot;, &quot;month&quot;, &quot;is_weekend&quot;]
+
+    # 統計特徵（關鍵：防維度爆炸）
+    stats_features:
+      enabled: true
+      lag_intervals: [1, 4]             # 1個區間, 4個區間（非絕對時間）
+      rolling_windows: [4, 96]          # 4區間(1h), 96區間(24h) - 以資料點計
+      max_rolling_window_points: 1000   # 【安全限制】禁止超過 1000 點的視窗
+      aggregations: [&quot;mean&quot;, &quot;std&quot;, &quot;min&quot;, &quot;max&quot;]
+
+    # 輸出控制
+    output:
+      drop_original_flags: false        # 是否刪除輸入的 quality_flags 欄位
+      add_feature_metadata: true        # 是否加入 feature_source 中繼欄位
+</code></pre>
+<h3 id="22-feature-mapping">2.2 Feature Mapping 整合</h3>
+<p><code>feature_mapping.py</code> 需擴充以支援特徵工程：</p>
+<pre><code class="language-python">class FeatureMeta(BaseModel):
+    # 繼承自 Cleaner PRD 的 ColumnMeta
+    is_target: bool = False            # 是否為目標變數（不應產生 Lag）
+    enable_lag: bool = True            # 是否允許產生 Lag 特徵
+    enable_rolling: bool = True        # 是否允許產生 Rolling 特徵
+
+def get_features_for_engineering(site_config: dict) -&gt; List[FeatureMeta]:
+    &quot;&quot;&quot;回傳允許進行特徵工程的欄位列表（排除 ID、狀態碼等）&quot;&quot;&quot;
+    ...
+</code></pre>
+<hr />
+<h2 id="3">3. 分階段實作計畫</h2>
+<h3 id="phase-1-1">Phase 1: 基礎架構與安全機制 (預估 1 天)</h3>
+<h4 id="step-11">Step 1.1: 建立配置模型與輸入驗證</h4>
+<p><strong>檔案</strong>: <code>src/etl/config_models.py</code>（擴充）</p>
+<pre><code class="language-python">from pydantic import BaseModel, validator
+
+class StatsConfig(BaseModel):
+    lag_intervals: List[int]
+    rolling_windows: List[int]
+    max_rolling_window_points: int = 1000
+
+    @validator('rolling_windows')
+    def check_window_size(cls, v):
+        if any(x &gt; 1000 for x in v):
+            raise ValueError(f&quot;Rolling window exceeds safety limit of 1000 points&quot;)
+        return v
+
+class FeatureEngineeringConfig(BaseModel):
+    schema_version: Literal[&quot;1.1&quot;] = &quot;1.1&quot;
+    input_contract: FeatureEngineerInputContract
+    physics_features: PhysicsConfig
+    time_features: TimeConfig
+    stats_features: StatsConfig
+</code></pre>
+<h4 id="step-12">Step 1.2: 建立模組骨架與防禦機制</h4>
+<p><strong>檔案</strong>: <code>src/etl/feature_engineer.py</code></p>
+<pre><code class="language-python">class FeatureEngineer:
+    def __init__(self, config: FeatureEngineeringConfig):
+        self.config = config
+        self._validation_passed = False
+
+    def _validate_input(self, df: pl.DataFrame) -&gt; pl.DataFrame:
+        &quot;&quot;&quot;
+        輸入驗證與預處理：
+        1. 檢查 required_columns 存在
+        2. 驗證時間戳連續性（無跳躍或重複）
+        3. 處理 quality_flags（依策略 drop/onehot/ignore）
+        4. 記憶體預檢（估算產生特徵後的記憶體使用）
+        &quot;&quot;&quot;
+        # 時間連續性檢查（防止 Temporal Leakage）
+        if self.config.input_contract.expected_frequency:
+            # 驗證間隔是否恆定
+            pass
+
+    def transform(self, df: pl.DataFrame, cutoff_timestamp: Optional[datetime] = None) -&gt; pl.DataFrame:
+        &quot;&quot;&quot;
+        主入口方法
+
+        Args:
+            cutoff_timestamp: 【防資料洩漏】確保所有特徵計算不使用此時間點之後的資料
+                              用於訓練/推論分離場景
+        &quot;&quot;&quot;
+        # 1. 輸入驗證
+        df = self._validate_input(df)
+
+        # 2. 防資料洩漏檢查
+        if cutoff_timestamp and df[&quot;timestamp&quot;].max() &gt; cutoff_timestamp:
+            raise DataLeakageError(f&quot;Input contains data after cutoff {cutoff_timestamp}&quot;)
+
+        # 3. 依序產生特徵（順序很重要）
+        df = self._generate_physics_features(df)
+        df = self._generate_time_features(df)
+        df = self._generate_stats_features(df)  # 必須在最後，因為依賴前面產生的特徵
+
+        return df
+</code></pre>
+<h3 id="phase-2-1">Phase 2: 物理特徵引擎 (預估 1 天)</h3>
+<h4 id="step-21">Step 2.1: 建立獨立物理公式庫</h4>
+<p><strong>檔案</strong>: <code>src/utils/physics.py</code>（從 Cleaner 遷移並強化）</p>
+<pre><code class="language-python">import polars as pl
+
+def calculate_wet_bulb_temp(
+    t_db: pl.Series,      # 乾球溫度 (°C)
+    rh: pl.Series,        # 相對濕度 (%)
+    pressure: pl.Series,  # 大氣壓 (hPa)
+    temp_range: Tuple[float, float] = (-40, 60),
+    rh_range: Tuple[float, float] = (0, 100)
+) -&gt; pl.Series:
+    &quot;&quot;&quot;
+    計算濕球溫度 (Wet Bulb Temperature)
+
+    邊界處理：
+    - 輸入超出物理範圍時回傳 Null（非拋出例外）
+    - 使用 ASHRAE 標準公式或 psychrolib
+    &quot;&quot;&quot;
+    # 邊界檢查
+    valid_mask = (
+        t_db.is_between(temp_range[0], temp_range[1]) &amp; 
+        rh.is_between(rh_range[0], rh_range[1])
+    )
+
+    # 計算（向量化）
+    result = _ashrae_wet_bulb_formula(t_db, rh, pressure)
+
+    # 無效值保護
+    return pl.when(valid_mask).then(result).otherwise(None)
+
+def calculate_enthalpy(t_db: pl.Series, w: pl.Series) -&gt; pl.Series:
+    &quot;&quot;&quot;計算焓值 (kJ/kg)，輸入：溫度(°C)、含濕量(kg/kg)&quot;&quot;&quot;
+    ...
+</code></pre>
+<h4 id="step-22">Step 2.2: 實作物理特徵轉換層</h4>
+<p><strong>邏輯</strong>:<br />
+- 從 <code>feature_mapping</code> 識別 <code>physical_type</code> 為 <code>temperature</code> 與 <code>humidity</code> 的欄位對<br />
+- 自動配對計算（如 <code>dry_bulb_temp_ch1</code> + <code>relative_humidity_ch1</code> → <code>wet_bulb_temp_ch1</code>）<br />
+- <strong>命名規範</strong>: <code>{location}_wet_bulb_temp_physics</code>, <code>{location}_enthalpy_physics</code></p>
+<h3 id="phase-3-15">Phase 3: 時間與統計特徵 (預估 1.5 天)</h3>
+<h4 id="step-31">Step 3.1: 時間特徵與週期性編碼</h4>
+<pre><code class="language-python">def _generate_time_features(self, df: pl.DataFrame) -&gt; pl.DataFrame:
+    &quot;&quot;&quot;產生時間特徵與週期性編碼&quot;&quot;&quot;
+    # 基礎時間元件
+    df = df.with_columns([
+        pl.col(&quot;timestamp&quot;).dt.hour().alias(&quot;hour_time&quot;),
+        pl.col(&quot;timestamp&quot;).dt.weekday().alias(&quot;day_of_week_time&quot;),
+        pl.col(&quot;timestamp&quot;).dt.month().alias(&quot;month_time&quot;),
+        (pl.col(&quot;timestamp&quot;).dt.weekday() &gt;= 5).alias(&quot;is_weekend_time&quot;)
+    ])
+
+    # 週期性編碼（解決 23:00 與 00:00 距離問題）
+    if self.config.time_features.cyclical_encoding:
+        df = df.with_columns([
+            (2 * np.pi * pl.col(&quot;hour_time&quot;) / 24).sin().alias(&quot;hour_sin_time&quot;),
+            (2 * np.pi * pl.col(&quot;hour_time&quot;) / 24).cos().alias(&quot;hour_cos_time&quot;),
+            (2 * np.pi * pl.col(&quot;day_of_week_time&quot;) / 7).sin().alias(&quot;dow_sin_time&quot;),
+            (2 * np.pi * pl.col(&quot;day_of_week_time&quot;) / 7).cos().alias(&quot;dow_cos_time&quot;)
+        ])
+
+    return df
+</code></pre>
+<h4 id="step-32-lag-rolling">Step 3.2: Lag 與 Rolling 特徵（含安全機制）</h4>
+<pre><code class="language-python">def _generate_stats_features(self, df: pl.DataFrame) -&gt; pl.DataFrame:
+    &quot;&quot;&quot;
+    產生統計特徵，嚴格遵守記憶體安全限制
+    &quot;&quot;&quot;
+    # 取得可進行統計運算的數值欄位（排除 timestamp, quality_flags 等）
+    numeric_cols = [
+        c for c in df.columns 
+        if get_feature_meta(c).enable_lag or get_feature_meta(c).enable_rolling
+    ]
+
+    expressions = []
+
+    # Lag 特徵（延遲）
+    for col in numeric_cols:
+        for lag in self.config.stats_features.lag_intervals:
+            expressions.append(
+                pl.col(col).shift(lag).alias(f&quot;{col}_lag_{lag}&quot;)
+            )
+
+    # Rolling 特徵（滾動統計）
+    for col in numeric_cols:
+        for window in self.config.stats_features.rolling_windows:
+            # 安全檢查：視窗大小不得超過資料長度的 50%
+            if window &gt; len(df) * 0.5:
+                logger.warning(f&quot;Skipping rolling window {window} for {col}: exceeds 50% of data length&quot;)
+                continue
+
+            for agg in self.config.stats_features.aggregations:
+                expr = getattr(pl.col(col).rolling_mean(window), agg)()
+                expressions.append(
+                    expr.alias(f&quot;{col}_roll{agg}_{window}&quot;)
+                )
+
+    return df.with_columns(expressions)
+</code></pre>
+<h3 id="phase-4-quality-flags">Phase 4: Quality Flags 處理策略</h3>
+<p>依據 <code>input_contract.quality_flags_handling</code> 執行：</p>
+<pre><code class="language-python">def _handle_quality_flags(self, df: pl.DataFrame) -&gt; pl.DataFrame:
+    strategy = self.config.input_contract.quality_flags_handling
+
+    if strategy == &quot;drop&quot;:
+        # 刪除任何有標記的列（保守策略）
+        has_flags = pl.col(&quot;quality_flags&quot;).list.len() &gt; 0
+        return df.filter(~has_flags)
+
+    elif strategy == &quot;onehot&quot;:
+        # 將標記拆解為 One-Hot 特徵（推薦，保留資訊供模型學習）
+        all_flags = [&quot;FROZEN&quot;, &quot;HEAT_IMBALANCE&quot;, &quot;AFFINITY_VIOLATION&quot;, &quot;OUTLIER&quot;]
+        for flag in all_flags:
+            df = df.with_columns(
+                pl.col(&quot;quality_flags&quot;).list.contains(flag).alias(f&quot;is_{flag.lower()}_flag&quot;)
+            )
+        return df
+
+    elif strategy == &quot;ignore&quot;:
+        # 忽略，不處理（快速但不建議）
+        return df
+</code></pre>
+<hr />
+<h2 id="4">4. 驗證與測試計畫</h2>
+<h3 id="41">4.1 單元測試（強化版）</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">測試案例</th>
+<th style="text-align: left;">驗證內容</th>
+<th style="text-align: center;">通過標準</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Case A (Physics Accuracy)</strong></td>
+<td style="text-align: left;">輸入 30°C / 50% RH，驗證濕球溫度計算</td>
+<td style="text-align: center;">誤差 &lt; 0.1°C（與 ASHRAE 表格比對）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case B (Cyclical Encoding)</strong></td>
+<td style="text-align: left;">驗證 23:00 的 <code>hour_sin/cos</code> 與 01:00 是否鄰近</td>
+<td style="text-align: center;">向量距離 &lt; 0.5（cos/sin 平面距離）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case C (Temporal Leakage)</strong></td>
+<td style="text-align: left;">驗證 Lag 特徵未參照未來資料</td>
+<td style="text-align: center;"><code>cutoff_timestamp</code> 後的資料被正確排除</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case D (Memory Safety)</strong></td>
+<td style="text-align: left;">測試 100 萬筆資料 + 大視窗 Rolling</td>
+<td style="text-align: center;">記憶體峰值 &lt; 原始 DataFrame 的 150%</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case E (Temporal Integrity)</strong></td>
+<td style="text-align: left;">測試時間序列有缺失時 Lag 行為</td>
+<td style="text-align: center;">空缺處正確標記為 Null，無錯誤對齊</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case F (Idempotency)</strong></td>
+<td style="text-align: left;">同一批資料執行兩次 <code>transform()</code></td>
+<td style="text-align: center;">結果 Bit-wise 完全一致</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case G (Null Propagation)</strong></td>
+<td style="text-align: left;">輸入含 Null，驗證特徵計算行為</td>
+<td style="text-align: center;">Null 不傳播（除依賴 Null 的特徵外），且不拋出例外</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Case H (Quality Flags One-Hot)</strong></td>
+<td style="text-align: left;">驗證 quality_flags 拆解正確</td>
+<td style="text-align: center;"><code>is_frozen_flag</code> 等欄位正確標記 0/1</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42">4.2 整合驗證</h3>
+<ul>
+<li><strong>與 Cleaner v2.0 整合</strong>：使用 Cleaner 輸出（含 <code>quality_flags</code>）作為輸入，驗證整條 Pipeline 記憶體使用 &lt; 8GB（Cleaner 4GB + Feature Engineer 4GB）</li>
+<li><strong>與 Model 銜接</strong>：驗證產生的特徵矩陣可被 XGBoost 直接讀取（無 Null、無無限值、無字串欄位殘留）</li>
+</ul>
+<hr />
+<h2 id="5">5. 風險評估與緩解</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">風險</th>
+<th style="text-align: center;">嚴重度</th>
+<th style="text-align: left;">緩解措施（已整合至設計）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>維度爆炸 (Feature Explosion)</strong></td>
+<td style="text-align: center;">🔴 Critical</td>
+<td style="text-align: left;"><code>max_rolling_window_points: 1000</code> 強制限制，超過拋出 <code>ConfigurationError</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Temporal Leakage</strong></td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: left;">時間連續性驗證 + <code>cutoff_timestamp</code> 防護機制</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>記憶體 OOM</strong></td>
+<td style="text-align: center;">🔴 High</td>
+<td style="text-align: left;">記憶體預檢（Pre-flight check），估算超過 150% 原始資料時改用 Streaming Mode</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Input Contract 違反</strong></td>
+<td style="text-align: center;">🟠 High</td>
+<td style="text-align: left;"><code>_validate_input()</code> 嚴格檢查，違反時拋出明確錯誤訊息（而非神秘崩潰）</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>物理計算邊界錯誤</strong></td>
+<td style="text-align: center;">🟠 Medium</td>
+<td style="text-align: left;">無效值回傳 Null（非拋出例外），避免整批失敗</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>特徵命名衝突</strong></td>
+<td style="text-align: center;">🟡 Medium</td>
+<td style="text-align: left;">嚴格命名規範 <code>{col}_{transform}_{param}</code>，若欄位已存在則拋出 <code>DuplicateFeatureError</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6">6. 交付產物清單</h2>
+<ol>
+<li><code>src/etl/feature_engineer.py</code>: 核心程式碼（含防禦機制與驗證）</li>
+<li><code>src/etl/config_models.py</code>: 擴充的 Pydantic 配置模型（與 Cleaner PRD 共用）</li>
+<li><code>src/utils/physics.py</code>: 獨立物理公式庫（從 Cleaner 遷移，含邊界檢查）</li>
+<li><code>tests/test_feature_engineer.py</code>: 涵蓋 Case A~H 的完整測試</li>
+<li><code>tests/test_physics_utils.py</code>: 物理公式準確性測試（與 ASHRAE 標準值比對）</li>
+<li><code>config/settings.yaml</code>: 更新範本（含 <code>etl_pipeline.feature_engineer</code> 區塊）</li>
+<li><code>docs/feature_engineering_guide.md</code>: 給 Data Scientist 的使用指南（如何配置 Lag/Rolling）</li>
+</ol>
+<hr />
+<h2 id="7-cleaner-prd">7. 與 Cleaner PRD 的協作檢查清單</h2>
+<p>在開始 Phase 2（物理特徵）前，請與 Cleaner 負責人確認：</p>
+<ul>
+<li>[ ] Cleaner v2.0 輸出是否保證 <code>timestamp</code> 欄位存在且為 UTC？</li>
+<li>[ ] <code>quality_flags</code> 欄位格式是否為 <code>List[str]</code>（Polars <code>pl.List(pl.Utf8)</code>）？</li>
+<li>[ ] Cleaner 的 <code>fill_strategy</code> 是否會產生時間空缺？若有，Feature Engineer 應如何處理（<code>upsample</code> 或保留 Null）？</li>
+<li>[ ] 兩者的 <code>settings.yaml</code> 配置路徑是否一致（<code>etl_pipeline.cleaner</code> + <code>etl_pipeline.feature_engineer</code>）？</li>
+<li>[ ] 記憶體預算如何分配？建議 Cleaner:Feature Engineer = 4GB:4GB，總計 8GB 上限</li>
+</ul>
+<hr />
+<p><strong>審閱重點</strong>：請特別確認 <strong>Step 3.2 的 Rolling Window 安全限制</strong> 與 <strong>Quality Flags 處理策略</strong> 是否符合下游 XGBoost 模型的期望（是否需要 <code>is_frozen</code> 作為特徵，還是直接丟棄異常資料）。<br />
+```</p>
+</body>
+</html>
